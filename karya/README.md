@@ -18,23 +18,31 @@ Linux and the web, frame pacing. The plan of record is section 4.3 of
 
 ## Using it from an app
 
-`karya/gpui-pre.py` turns the branch's changes into crates with the gpui-pre
-names and versions:
-
-```sh
-karya/gpui-pre.py --version 0.3.12 --out ../gpui-pre-karya
-```
-
-It writes only the crates the branch changes. An app patches exactly those:
+The patched crates are published as the branch `crates/gpui-pre-<version>`
+of this repo, with the gpui-pre names and versions. An app or workspace
+patches the crates that branch holds (today `gpui-pre-apple` and
+`gpui-pre-macos`):
 
 ```toml
 [patch.crates-io]
-gpui-pre-apple = { path = "../gpui-pre-karya/gpui-pre-apple" }
+gpui-pre-apple = { git = "https://github.com/karyalabs/zed", branch = "crates/gpui-pre-0.3.12" }
+gpui-pre-macos = { git = "https://github.com/karyalabs/zed", branch = "crates/gpui-pre-0.3.12" }
 ```
 
-gpui-kit, gpuicn and anything else built on gpui-pre then compile against the
-patched crates unchanged. Where the generated crates are published (a branch
-of this repo, so apps can use a `git` source) is still to be decided.
+gpui-kit, gpuicn and anything else built on gpui-pre then compile against
+the patched crates unchanged. `[patch]` applies only to the workspace that
+declares it, so a crate published to crates.io still builds on stock
+gpui-pre for its users.
+
+After merging a patch into `gpui-pre/<version>`, publish the crates again:
+
+```sh
+karya/publish.sh 0.3.12
+```
+
+To try a branch without publishing, `karya/gpui-pre.py --version 0.3.12
+--out <folder>` writes the crates locally (gpui-av's `scripts/karya-gpui`
+does this for any ref).
 
 ## Moving to a new gpui-pre release
 
