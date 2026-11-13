@@ -10,7 +10,9 @@ use gpui::{
 use image::RgbaImage;
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_core_foundation::{CFRetained, CGSize};
-use objc2_core_graphics::{CGColorSpace, kCGColorSpaceDisplayP3};
+use objc2_core_graphics::{
+    CGColorSpace, kCGColorSpaceDisplayP3, kCGColorSpaceExtendedDisplayP3, kCGColorSpaceExtendedSRGB,
+};
 use objc2_core_video::{
     CVMetalTexture, CVMetalTextureCache, CVMetalTextureGetTexture, CVPixelBufferGetHeight,
     CVPixelBufferGetHeightOfPlane, CVPixelBufferGetWidth,
@@ -47,6 +49,61 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+/// The layer's format while it shows extended range (EDR) content.
+const EDR_PIXEL_FORMAT: MTLPixelFormat = MTLPixelFormat::RGBA16Float;
+/// Draws without an HDR surface before the layer leaves EDR, so a frame that
+/// briefly lacks one does not flip the layer's format back and forth.
+const EDR_LINGER_DRAWS: u32 = 30;
+
+/// The pipelines that draw into the frame's target, for one target format.
+/// Path rasterization draws into its own BGRA texture and is not among them.
+struct TargetPipelines {
+    format: MTLPixelFormat,
+    path_sprites: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    shadows: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    quads: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    underlines: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    monochrome_sprites: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    polychrome_sprites: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    surfaces: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+}
+
+impl TargetPipelines {
+    fn build(
+        device: &ProtocolObject<dyn MTLDevice>,
+        library: &ProtocolObject<dyn MTLLibrary>,
+        format: MTLPixelFormat,
+    ) -> Result<Self> {
+        let pipeline = |label, vertex, fragment| {
+            build_pipeline_state(device, library, label, vertex, fragment, format)
+        };
+        Ok(Self {
+            format,
+            path_sprites: build_path_sprite_pipeline_state(
+                device,
+                library,
+                "path_sprites",
+                "path_sprite_vertex",
+                "path_sprite_fragment",
+                format,
+            )?,
+            shadows: pipeline("shadows", "shadow_vertex", "shadow_fragment")?,
+            quads: pipeline("quads", "quad_vertex", "quad_fragment")?,
+            underlines: pipeline("underlines", "underline_vertex", "underline_fragment")?,
+            monochrome_sprites: pipeline(
+                "monochrome_sprites",
+                "monochrome_sprite_vertex",
+                "monochrome_sprite_fragment",
+            )?,
+            polychrome_sprites: pipeline(
+                "polychrome_sprites",
+                "polychrome_sprite_vertex",
+                "polychrome_sprite_fragment",
+            )?,
+            surfaces: pipeline("surfaces", "surface_vertex", "surface_fragment")?,
+        })
+    }
+}
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -153,9 +210,21 @@ pub struct MetalRenderer {
     path_sample_count: u32,
     /// Whether the layer is tagged Display P3, which surface colour targets.
     output_p3: bool,
-    /// The brightest value the window's screen can show now, in units of SDR
-    /// white. 1 until the platform reports more.
+    /// The brightest value surfaces may use in the frame being drawn, in
+    /// units of SDR white: the screen's current EDR headroom while drawing
+    /// into an extended range target, otherwise 1.
     edr_headroom: f32,
+    /// The window screen's EDR headroom, potential and current, as the
+    /// platform last reported it (see `set_edr_headroom`).
+    screen_edr_headroom: (f32, f32),
+    /// Draws left before the layer leaves EDR once no HDR surface is shown.
+    edr_linger: u32,
+    /// The library, kept to build pipelines for another target format.
+    library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    /// The pixel format the drawing pipelines above target.
+    target_format: MTLPixelFormat,
+    /// Pipelines for the other target format, once built.
+    spare_pipelines: Option<TargetPipelines>,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -449,6 +518,11 @@ impl MetalRenderer {
             path_sample_count: PATH_SAMPLE_COUNT,
             output_p3: false,
             edr_headroom: 1.0,
+            screen_edr_headroom: (1.0, 1.0),
+            edr_linger: 0,
+            library,
+            target_format: MTLPixelFormat::BGRA8Unorm,
+            spare_pipelines: None,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
         })
@@ -591,6 +665,83 @@ impl MetalRenderer {
         Ok(())
     }
 
+    /// Report the EDR headroom of the screen the window is on, in units of
+    /// SDR white: `potential` is the most it can reach, `current` what it
+    /// allows now (it rises once an EDR layer is shown). The layer switches
+    /// to extended range output only while an HDR surface is drawn and the
+    /// screen can show more than SDR.
+    pub fn set_edr_headroom(&mut self, potential: f32, current: f32) {
+        self.screen_edr_headroom = (potential, current);
+    }
+
+    fn update_edr(&mut self, scene: &Scene, layer: &CAMetalLayer) {
+        let shows_hdr = self.screen_edr_headroom.0 > 1.0
+            && scene
+                .surfaces
+                .iter()
+                .any(|surface| crate::surface_color::is_hdr(&surface.image_buffer));
+        if shows_hdr {
+            self.edr_linger = EDR_LINGER_DRAWS;
+        } else {
+            self.edr_linger = self.edr_linger.saturating_sub(1);
+        }
+        let wants_edr = self.edr_linger > 0;
+        if layer.wantsExtendedDynamicRangeContent() == wants_edr {
+            return;
+        }
+        // SAFETY: The constants are extern, from Core Graphics.
+        let colorspace_name = unsafe {
+            match (wants_edr, self.output_p3) {
+                (true, true) => Some(kCGColorSpaceExtendedDisplayP3),
+                (true, false) => Some(kCGColorSpaceExtendedSRGB),
+                (false, true) => Some(kCGColorSpaceDisplayP3),
+                (false, false) => None,
+            }
+        };
+        let colorspace = colorspace_name.and_then(|name| CGColorSpace::with_name(Some(name)));
+        layer.setColorspace(colorspace.as_deref());
+        layer.setPixelFormat(if wants_edr {
+            EDR_PIXEL_FORMAT
+        } else {
+            MTLPixelFormat::BGRA8Unorm
+        });
+        layer.setWantsExtendedDynamicRangeContent(wants_edr);
+        log::info!(
+            "{} extended dynamic range output (screen headroom {:.2})",
+            if wants_edr { "starting" } else { "stopping" },
+            self.screen_edr_headroom.0
+        );
+    }
+
+    /// Makes the drawing pipelines target `format`, building them the first
+    /// time it is used.
+    fn use_target_format(&mut self, format: MTLPixelFormat) -> Result<()> {
+        if self.target_format == format {
+            return Ok(());
+        }
+        let mut pipelines = match self.spare_pipelines.take() {
+            Some(spare) if spare.format == format => spare,
+            _ => TargetPipelines::build(&self.device, &self.library, format)?,
+        };
+        mem::swap(&mut self.path_sprites_pipeline_state, &mut pipelines.path_sprites);
+        mem::swap(&mut self.shadows_pipeline_state, &mut pipelines.shadows);
+        mem::swap(&mut self.quads_pipeline_state, &mut pipelines.quads);
+        mem::swap(&mut self.underlines_pipeline_state, &mut pipelines.underlines);
+        mem::swap(
+            &mut self.monochrome_sprites_pipeline_state,
+            &mut pipelines.monochrome_sprites,
+        );
+        mem::swap(
+            &mut self.polychrome_sprites_pipeline_state,
+            &mut pipelines.polychrome_sprites,
+        );
+        mem::swap(&mut self.surfaces_pipeline_state, &mut pipelines.surfaces);
+        pipelines.format = self.target_format;
+        self.target_format = format;
+        self.spare_pipelines = Some(pipelines);
+        Ok(())
+    }
+
     pub fn update_transparency(&mut self, transparent: bool) {
         self.opaque = !transparent;
         if let Some(layer) = &self.layer {
@@ -612,6 +763,7 @@ impl MetalRenderer {
                 return;
             }
         };
+        self.update_edr(scene, &layer);
         let drawable = match &mut self.display_link_mode {
             DisplayLinkMode::Attached { drawable } => {
                 let Some(drawable) = drawable.take() else {
@@ -666,6 +818,15 @@ impl MetalRenderer {
         if self.path_intermediate_texture.is_none() {
             self.update_path_intermediate_textures(viewport_size)?;
         }
+        // A display link may hand out a drawable made before the layer last
+        // changed format, so follow the texture rather than the layer.
+        let target_format = texture.pixelFormat();
+        self.use_target_format(target_format)?;
+        self.edr_headroom = if target_format == EDR_PIXEL_FORMAT {
+            self.screen_edr_headroom.1.max(1.0)
+        } else {
+            1.0
+        };
         let mut writer = InstanceBufferWriter::new(
             &self.device,
             &self.instance_buffer_pool,
