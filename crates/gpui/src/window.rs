@@ -195,6 +195,15 @@ impl WindowInvalidator {
         }
     }
 
+    /// Schedules a redraw of the given view, without notifying its observers.
+    /// Ignored while a draw is in progress, like [`Window::refresh`].
+    pub fn redraw_view(&self, entity: EntityId) {
+        if self.not_drawing() {
+            self.inner.borrow_mut().dirty_views.insert(entity);
+            self.set_dirty(true);
+        }
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.inner.borrow().dirty
     }
@@ -505,6 +514,7 @@ pub(crate) struct FocusRef {
 impl FocusId {
     /// Obtains whether the element associated with this handle is currently focused.
     pub fn is_focused(&self, window: &Window) -> bool {
+        window.record_focus_dependency();
         window.focus == Some(*self)
     }
 
@@ -787,10 +797,9 @@ impl HitboxId {
         if window.captured_hitbox == Some(self) {
             return true;
         }
-        if window.last_input_was_keyboard() {
-            return false;
-        }
-        self.hit_test(window)
+        // The modality is only read for a hitbox under the pointer, so that only
+        // the views that own one are redrawn when the modality changes.
+        self.hit_test(window) && !window.last_input_was_keyboard()
     }
 
     /// Checks if the hitbox with this ID is currently hovered, regardless of the last
@@ -1288,6 +1297,15 @@ pub struct Window {
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
+    /// Counts the frames drawn, so that state kept across frames can tell
+    /// which frame its indices refer to.
+    pub(crate) frame_number: u64,
+    /// Views that read the window's focus while they were drawn. They are
+    /// redrawn when focus moves, so the rest of the window can keep its cache.
+    focus_dependent_views: RefCell<FxHashSet<EntityId>>,
+    /// Views whose appearance depended on the input modality while they were
+    /// drawn: a hovered hitbox, or a focus-visible style.
+    input_modality_dependent_views: RefCell<FxHashSet<EntityId>>,
     pub(crate) activation_observers: SingleSubscriberSet<AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -2412,6 +2430,9 @@ impl Window {
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
+            frame_number: 0,
+            focus_dependent_views: RefCell::default(),
+            input_modality_dependent_views: RefCell::default(),
             activation_observers: SingleSubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -2595,6 +2616,48 @@ impl Window {
         }
     }
 
+    /// Schedules the given view to be redrawn on the next frame, leaving cached
+    /// views outside of its ancestors untouched. Unlike [`App::notify`], the
+    /// view's observers are not called.
+    pub(crate) fn redraw_view(&mut self, view_id: EntityId) {
+        self.invalidator.redraw_view(view_id);
+    }
+
+    fn record_focus_dependency(&self) {
+        if let Some(view_id) = self.rendered_entity_stack.last() {
+            self.focus_dependent_views.borrow_mut().insert(*view_id);
+        }
+    }
+
+    fn record_input_modality_dependency(&self) {
+        if let Some(view_id) = self.rendered_entity_stack.last() {
+            self.input_modality_dependent_views
+                .borrow_mut()
+                .insert(*view_id);
+        }
+    }
+
+    /// Schedules a frame that redraws the views that read the window's focus,
+    /// and dispatches the focus events.
+    fn focus_changed(&mut self) {
+        if self.invalidator.not_drawing() {
+            let views = mem::take(&mut *self.focus_dependent_views.borrow_mut());
+            for view_id in views {
+                self.invalidator.redraw_view(view_id);
+            }
+            self.invalidator.set_dirty(true);
+        }
+    }
+
+    fn input_modality_changed(&mut self) {
+        if self.invalidator.not_drawing() {
+            let views = mem::take(&mut *self.input_modality_dependent_views.borrow_mut());
+            for view_id in views {
+                self.invalidator.redraw_view(view_id);
+            }
+        }
+    }
+
     /// Close this window.
     pub fn remove_window(&mut self) {
         self.removed = true;
@@ -2602,6 +2665,7 @@ impl Window {
 
     /// Obtain the currently focused [`FocusHandle`]. If no elements are focused, returns `None`.
     pub fn focused(&self, cx: &App) -> Option<FocusHandle> {
+        self.record_focus_dependency();
         self.focus
             .and_then(|id| FocusHandle::for_id(id, &cx.focus_handles))
     }
@@ -2627,7 +2691,7 @@ impl Window {
         self.focus_generation = self.focus_generation.wrapping_add(1);
         self.clear_pending_keystrokes(cx);
 
-        self.refresh();
+        self.focus_changed();
     }
 
     /// Remove focus from all elements within this context's window.
@@ -2642,7 +2706,7 @@ impl Window {
             self.focus_generation = self.focus_generation.wrapping_add(1);
         }
         self.focus = None;
-        self.refresh();
+        self.focus_changed();
     }
 
     /// Blur the window and don't allow anything in it to be focused again.
@@ -3641,11 +3705,13 @@ impl Window {
     /// Returns true if the last input event was keyboard-based (key press, tab navigation, etc.)
     /// This is used for focus-visible styling to show focus indicators only for keyboard navigation.
     pub fn last_input_was_keyboard(&self) -> bool {
+        self.record_input_modality_dependency();
         self.last_input_modality == InputModality::Keyboard
     }
 
     /// Returns whether the last input event came from a touch screen.
     pub fn last_input_was_touch(&self) -> bool {
+        self.record_input_modality_dependency();
         self.last_input_modality == InputModality::Touch
     }
 
@@ -3673,6 +3739,7 @@ impl Window {
             self.refresh();
         }
         self.invalidate_entities();
+        self.frame_number += 1;
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
@@ -3796,7 +3863,7 @@ impl Window {
         // schedule another frame here to render the new focus state and dispatch the
         // resulting focus events.
         if self.focus != focus_before_listeners {
-            self.refresh();
+            self.focus_changed();
         }
         self.needs_present.set(true);
 
@@ -5878,7 +5945,7 @@ impl Window {
             _ => self.last_input_modality,
         };
         if self.last_input_modality != old_modality {
-            self.refresh();
+            self.input_modality_changed();
         }
 
         // Handlers may set this to false by calling `stop_propagation`.
@@ -10514,6 +10581,199 @@ mod tests {
             cursor_observer.test_platform().cursor_style(),
             CursorStyle::IBeam
         );
+    }
+
+    struct RedrawScopeSidebar {
+        renders: usize,
+    }
+
+    impl Render for RedrawScopeSidebar {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders += 1;
+            div().size_full().child("label")
+        }
+    }
+
+    struct RedrawScopePane {
+        renders: usize,
+        focus_handle: FocusHandle,
+        inner: crate::Entity<RedrawScopeSidebar>,
+    }
+
+    impl Render for RedrawScopePane {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders += 1;
+            div()
+                .size_full()
+                .track_focus(&self.focus_handle)
+                .focus(|style| style.opacity(0.5))
+                .child(
+                    div()
+                        .id("button")
+                        .size(px(50.))
+                        .hover(|style| style.opacity(0.8))
+                        .active(|style| style.opacity(0.5))
+                        .on_click(|_, _, _| {}),
+                )
+                .child(
+                    self.inner
+                        .clone()
+                        .cached(crate::StyleRefinement::default().size(px(50.))),
+                )
+        }
+    }
+
+    struct RedrawScopeRoot {
+        sidebar: crate::Entity<RedrawScopeSidebar>,
+        pane: crate::Entity<RedrawScopePane>,
+    }
+
+    impl Render for RedrawScopeRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .child(
+                    self.sidebar
+                        .clone()
+                        .cached(crate::StyleRefinement::default().size(px(100.))),
+                )
+                .child(
+                    self.pane
+                        .clone()
+                        .cached(crate::StyleRefinement::default().size(px(100.))),
+                )
+        }
+    }
+
+    /// The number of times the sidebar, the pane, and the view cached inside
+    /// the pane have rendered, after drawing every frame that was requested.
+    fn redraw_scope_renders(
+        root: &crate::Entity<RedrawScopeRoot>,
+        cx: &mut crate::VisualTestContext,
+    ) -> (usize, usize, usize) {
+        cx.update(|window, cx| {
+            for _ in 0..3 {
+                if window.invalidator.is_dirty() {
+                    window.draw(cx).clear(cx);
+                }
+            }
+            let root = root.read(cx);
+            let pane = root.pane.read(cx);
+            (
+                root.sidebar.read(cx).renders,
+                pane.renders,
+                pane.inner.read(cx).renders,
+            )
+        })
+    }
+
+    fn redraw_scope_window(
+        cx: &mut TestAppContext,
+    ) -> (
+        crate::Entity<RedrawScopeRoot>,
+        &mut crate::VisualTestContext,
+    ) {
+        cx.add_window_view(|_, cx| RedrawScopeRoot {
+            sidebar: cx.new(|_| RedrawScopeSidebar { renders: 0 }),
+            pane: cx.new(|cx| RedrawScopePane {
+                renders: 0,
+                focus_handle: cx.focus_handle(),
+                inner: cx.new(|_| RedrawScopeSidebar { renders: 0 }),
+            }),
+        })
+    }
+
+    #[gpui::test]
+    fn pressing_an_element_redraws_only_its_view(cx: &mut TestAppContext) {
+        let (root, cx) = redraw_scope_window(cx);
+        let button = point(px(120.), px(20.));
+        cx.simulate_mouse_move(button, None, crate::Modifiers::default());
+        let (sidebar, pane, _) = redraw_scope_renders(&root, cx);
+
+        cx.simulate_mouse_down(button, MouseButton::Left, crate::Modifiers::default());
+        let (sidebar_after_down, pane_after_down, _) = redraw_scope_renders(&root, cx);
+        assert_eq!(sidebar_after_down, sidebar);
+        assert!(pane_after_down > pane);
+
+        cx.simulate_mouse_up(button, MouseButton::Left, crate::Modifiers::default());
+        let (sidebar_after_up, pane_after_up, _) = redraw_scope_renders(&root, cx);
+        assert_eq!(sidebar_after_up, sidebar);
+        assert!(pane_after_up > pane_after_down);
+    }
+
+    #[gpui::test]
+    fn moving_focus_redraws_only_views_that_read_it(cx: &mut TestAppContext) {
+        let (root, cx) = redraw_scope_window(cx);
+        let (sidebar, pane, _) = redraw_scope_renders(&root, cx);
+
+        let focus_handle = root.read_with(cx, |root, cx| root.pane.read(cx).focus_handle.clone());
+        cx.update(|window, cx| window.focus(&focus_handle, cx));
+        let (sidebar_after_focus, pane_after_focus, _) = redraw_scope_renders(&root, cx);
+        assert_eq!(sidebar_after_focus, sidebar);
+        assert!(pane_after_focus > pane);
+
+        cx.update(|window, cx| window.blur(cx));
+        let (sidebar_after_blur, pane_after_blur, _) = redraw_scope_renders(&root, cx);
+        assert_eq!(sidebar_after_blur, sidebar);
+        assert!(pane_after_blur > pane_after_focus);
+    }
+
+    #[gpui::test]
+    fn switching_input_modality_redraws_only_hovered_views(cx: &mut TestAppContext) {
+        let (root, cx) = redraw_scope_window(cx);
+        let button = point(px(120.), px(20.));
+        cx.simulate_mouse_move(button, None, crate::Modifiers::default());
+        let (sidebar, pane, _) = redraw_scope_renders(&root, cx);
+
+        cx.simulate_keystrokes("a");
+        let (sidebar_after_key, pane_after_key, _) = redraw_scope_renders(&root, cx);
+        assert_eq!(sidebar_after_key, sidebar);
+        assert!(pane_after_key > pane);
+    }
+
+    #[gpui::test]
+    fn nested_view_caching_keeps_views_inside_a_redrawn_view(cx: &mut TestAppContext) {
+        let (root, cx) = redraw_scope_window(cx);
+        let pane = root.read_with(cx, |root, _| root.pane.clone());
+        let (_, pane_renders, inner) = redraw_scope_renders(&root, cx);
+
+        pane.update(cx, |_, cx| cx.notify());
+        let (_, pane_renders_by_default, inner_by_default) = redraw_scope_renders(&root, cx);
+        assert!(pane_renders_by_default > pane_renders);
+        assert!(inner_by_default > inner);
+
+        cx.update(|_, cx| cx.set_nested_view_caching(true));
+        pane.update(cx, |_, cx| cx.notify());
+        let (_, pane_renders_when_nested, inner_when_nested) = redraw_scope_renders(&root, cx);
+        assert!(pane_renders_when_nested > pane_renders_by_default);
+        assert_eq!(inner_when_nested, inner_by_default);
+
+        cx.update(|window, _| window.refresh());
+        let (_, _, inner_after_refresh) = redraw_scope_renders(&root, cx);
+        assert!(inner_after_refresh > inner_when_nested);
+    }
+
+    #[gpui::test]
+    fn nested_view_caching_redraws_a_view_whose_ancestor_was_reused(cx: &mut TestAppContext) {
+        let (root, cx) = redraw_scope_window(cx);
+        let (sidebar, pane) =
+            root.read_with(cx, |root, _| (root.sidebar.clone(), root.pane.clone()));
+        cx.update(|_, cx| cx.set_nested_view_caching(true));
+        let (_, _, inner) = redraw_scope_renders(&root, cx);
+
+        // A frame that reuses the pane whole moves the inner view's output,
+        // so the next redraw of the pane has to draw the inner view again.
+        sidebar.update(cx, |_, cx| cx.notify());
+        let (_, _, inner_after_sidebar) = redraw_scope_renders(&root, cx);
+        assert_eq!(inner_after_sidebar, inner);
+
+        pane.update(cx, |_, cx| cx.notify());
+        let (_, _, inner_after_pane) = redraw_scope_renders(&root, cx);
+        assert_eq!(inner_after_pane, inner + 1);
+
+        pane.update(cx, |_, cx| cx.notify());
+        let (_, _, inner_after_second_pane) = redraw_scope_renders(&root, cx);
+        assert_eq!(inner_after_second_pane, inner_after_pane);
     }
 }
 

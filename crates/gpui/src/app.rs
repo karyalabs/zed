@@ -962,6 +962,7 @@ pub struct App {
     pub(crate) window_invalidators_by_entity:
         FxHashMap<EntityId, FxHashMap<WindowId, WindowInvalidator>>,
     pub(crate) tracked_entities: FxHashMap<WindowId, FxHashSet<EntityId>>,
+    pub(crate) nested_view_caching: bool,
     pub(crate) current_window_by_entity: FxHashMap<EntityId, WindowId>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_renderer: Option<crate::InspectorRenderer>,
@@ -1055,6 +1056,7 @@ impl App {
                 pending_global_notifications: Default::default(),
                 observers: SubscriberSet::new(),
                 tracked_entities: FxHashMap::default(),
+                nested_view_caching: false,
                 window_invalidators_by_entity: FxHashMap::default(),
                 current_window_by_entity: FxHashMap::default(),
                 event_listeners: SubscriberSet::new(),
@@ -1419,6 +1421,22 @@ impl App {
     /// multiple times in an update cycle and still result in a single redraw.
     pub fn refresh_windows(&mut self) {
         self.pending_effects.push_back(Effect::RefreshWindows);
+    }
+
+    /// Sets whether a cached view keeps its cache while a cached view that
+    /// contains it is redrawn. Off by default: redrawing a cached view also
+    /// redraws every cached view inside it.
+    ///
+    /// When on, a cached view is only redrawn when it was notified itself, when
+    /// its bounds, content mask, text style or opacity changed, or when the
+    /// window is refreshed. A view that draws from state it does not own must
+    /// then observe that state and notify, exactly as a cached view inside an
+    /// uncached parent already has to.
+    ///
+    /// The view is still redrawn once when the cached view that contains it
+    /// is redrawn after having been reused whole.
+    pub fn set_nested_view_caching(&mut self, enabled: bool) {
+        self.nested_view_caching = enabled;
     }
 
     #[inline(always)]
