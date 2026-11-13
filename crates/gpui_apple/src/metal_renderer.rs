@@ -2116,6 +2116,7 @@ mod tests {
     use super::*;
     use objc2_core_foundation::{CFDictionary, CFType};
     use objc2_core_video::{
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
         CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane,
         CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
         CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,

@@ -59,8 +59,6 @@ pub(crate) enum SurfacePlanes {
 pub(crate) struct SurfaceFormat {
     pub planes: SurfacePlanes,
     pub color: SurfaceColor,
-    /// Whether the surface wants more than SDR brightness.
-    pub is_hdr: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -74,6 +72,9 @@ impl SurfaceFormat {
     /// Reads the format and colour of `buffer`. `output_p3` is whether the
     /// target is tagged Display P3 (otherwise sRGB); `headroom` is the
     /// brightest value it can show, in units of SDR white.
+    // CoreVideo's format constants are lowercase, which the lint takes for
+    // bindings in match patterns.
+    #[allow(non_upper_case_globals)]
     pub fn of(buffer: &CVPixelBuffer, output_p3: bool, headroom: f32) -> Result<Self> {
         let pixel_format = CVPixelBufferGetPixelFormatType(buffer);
         let (planes, bits, full_range) = match pixel_format {
@@ -118,11 +119,7 @@ impl SurfaceFormat {
                 1.0
             },
         };
-        Ok(Self {
-            planes,
-            color,
-            is_hdr,
-        })
+        Ok(Self { planes, color })
     }
 
     /// GPUI's original surface: full-range 8-bit NV12 with a fixed BT.601
@@ -143,7 +140,6 @@ impl SurfaceFormat {
                 headroom: 1.0,
                 content_peak: 1.0,
             },
-            is_hdr: false,
         }
     }
 }
