@@ -68,6 +68,12 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct DispatchNodeId(usize);
 
+impl DispatchNodeId {
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
 pub(crate) struct DispatchTree {
     node_stack: Vec<DispatchNodeId>,
     pub(crate) context_stack: Vec<KeyContext>,

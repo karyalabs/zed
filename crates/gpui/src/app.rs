@@ -963,6 +963,7 @@ pub struct App {
         FxHashMap<EntityId, FxHashMap<WindowId, WindowInvalidator>>,
     pub(crate) tracked_entities: FxHashMap<WindowId, FxHashSet<EntityId>>,
     pub(crate) nested_view_caching: bool,
+    pub(crate) moved_view_reuse: bool,
     pub(crate) current_window_by_entity: FxHashMap<EntityId, WindowId>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_renderer: Option<crate::InspectorRenderer>,
@@ -1057,6 +1058,7 @@ impl App {
                 observers: SubscriberSet::new(),
                 tracked_entities: FxHashMap::default(),
                 nested_view_caching: false,
+                moved_view_reuse: false,
                 window_invalidators_by_entity: FxHashMap::default(),
                 current_window_by_entity: FxHashMap::default(),
                 event_listeners: SubscriberSet::new(),
@@ -1437,6 +1439,20 @@ impl App {
     /// is redrawn after having been reused whole.
     pub fn set_nested_view_caching(&mut self, enabled: bool) {
         self.nested_view_caching = enabled;
+    }
+
+    /// Sets whether a cached view that only moved, such as a row of a
+    /// scrolling list, keeps its cache. Off by default: a cached view whose
+    /// origin changed is redrawn.
+    ///
+    /// When on, the view's last output is replayed at the new position as long
+    /// as it was entirely visible, moved by a whole number of device pixels,
+    /// and holds neither the pointer, the focus, a deferred element nor a text
+    /// input. Anything the view recorded from its absolute position while it
+    /// drew stays as it was until the view is drawn again, which happens
+    /// before a mouse event is dispatched inside it.
+    pub fn set_moved_view_reuse(&mut self, enabled: bool) {
+        self.moved_view_reuse = enabled;
     }
 
     #[inline(always)]

@@ -351,3 +351,30 @@ pub struct GpuSpecs {
     /// Further information about the driver, as reported by Vulkan.
     pub driver_info: String,
 }
+
+#[allow(missing_docs)]
+pub mod moved_stats {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    pub static COUNTS: [AtomicUsize; 10] = [const { AtomicUsize::new(0) }; 10];
+    pub static RENDERS: AtomicUsize = AtomicUsize::new(0);
+    pub static MISS: [AtomicUsize; 10] = [const { AtomicUsize::new(0) }; 10];
+    pub static PLAIN: AtomicUsize = AtomicUsize::new(0);
+    pub fn record(reason: usize) {
+        COUNTS[reason].fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn dump() -> String {
+        format!(
+            "miss[nostate,mask,text,opacity,dirty,refreshing,sameframe,oldframe,moved-declined]={:?} moved={} size/a11y={} clipped={} fraction={} pointer={} deferred/tooltip/input={} focus={} plain_hits={} renders={}",
+            MISS,
+            COUNTS[0].load(Ordering::Relaxed),
+            COUNTS[1].load(Ordering::Relaxed),
+            COUNTS[2].load(Ordering::Relaxed),
+            COUNTS[3].load(Ordering::Relaxed),
+            COUNTS[4].load(Ordering::Relaxed),
+            COUNTS[5].load(Ordering::Relaxed),
+            COUNTS[6].load(Ordering::Relaxed),
+            PLAIN.load(Ordering::Relaxed),
+            RENDERS.load(Ordering::Relaxed),
+        )
+    }
+}
