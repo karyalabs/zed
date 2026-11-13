@@ -320,12 +320,38 @@ impl<V: View> IntoElement for ViewElement<V> {
 }
 
 struct ViewElementState {
+    /// The frame that `prepaint_range` indexes into.
+    frame: u64,
     prepaint_range: Range<PrepaintStateIndex>,
+    /// When this frame's prepaint was reused from the rendered frame, the range
+    /// it was reused from. A view can be prepainted more than once in a frame
+    /// (see [`Window::transact`]); a later pass reuses the same range again,
+    /// because `prepaint_range` then indexes into the frame being built.
+    reused_from: Option<Range<PrepaintStateIndex>>,
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     /// The entities the view accessed while it was last drawn, in any phase,
     /// restored when its prepaint is reused so the window stays subscribed.
     accessed_entities: FxHashSet<EntityId>,
+}
+
+impl ViewElementState {
+    /// The range of the rendered frame that holds this view's last prepaint,
+    /// if it is still there to reuse.
+    ///
+    /// The ranges are only current while this view's own prepaint runs every
+    /// frame. When a cached ancestor is reused whole, this view's output moves
+    /// with it and this state is carried over untouched, so its ranges no
+    /// longer point at this view's output and it has to be drawn again.
+    fn rendered_range(&self, window: &Window) -> Option<Range<PrepaintStateIndex>> {
+        if self.frame == window.frame_number {
+            self.reused_from.clone()
+        } else if self.frame + 1 == window.frame_number {
+            Some(self.prepaint_range.clone())
+        } else {
+            None
+        }
+    }
 }
 
 struct ViewElementCacheKey {
@@ -555,13 +581,16 @@ fn prepaint_view(
                     && element_state.cache_key.opacity.to_bits() == opacity.to_bits()
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
+                    && let Some(rendered_range) = element_state.rendered_range(window)
                 {
                     let prepaint_start = window.prepaint_index();
-                    window.reuse_prepaint(element_state.prepaint_range.clone());
+                    window.reuse_prepaint(rendered_range.clone());
                     cx.entities
                         .extend_accessed(element_state.accessed_entities.iter().copied());
                     let prepaint_end = window.prepaint_index();
+                    element_state.frame = window.frame_number;
                     element_state.prepaint_range = prepaint_start..prepaint_end;
+                    element_state.reused_from = Some(rendered_range);
 
                     return (None, element_state);
                 }
@@ -583,7 +612,9 @@ fn prepaint_view(
                     Some(element),
                     ViewElementState {
                         accessed_entities,
+                        frame: window.frame_number,
                         prepaint_range: prepaint_start..prepaint_end,
+                        reused_from: None,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
                         cache_key: ViewElementCacheKey {
                             bounds,

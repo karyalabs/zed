@@ -1297,6 +1297,9 @@ pub struct Window {
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
+    /// Counts the frames drawn, so that state kept across frames can tell
+    /// which frame its indices refer to.
+    pub(crate) frame_number: u64,
     /// Views that read the window's focus while they were drawn. They are
     /// redrawn when focus moves, so the rest of the window can keep its cache.
     focus_dependent_views: RefCell<FxHashSet<EntityId>>,
@@ -2427,6 +2430,7 @@ impl Window {
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
+            frame_number: 0,
             focus_dependent_views: RefCell::default(),
             input_modality_dependent_views: RefCell::default(),
             activation_observers: SingleSubscriberSet::new(),
@@ -3735,6 +3739,7 @@ impl Window {
             self.refresh();
         }
         self.invalidate_entities();
+        self.frame_number += 1;
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
@@ -10585,7 +10590,7 @@ mod tests {
     impl Render for RedrawScopeSidebar {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             self.renders += 1;
-            div().size_full()
+            div().size_full().child("label")
         }
     }
 
@@ -10746,6 +10751,29 @@ mod tests {
         cx.update(|window, _| window.refresh());
         let (_, _, inner_after_refresh) = redraw_scope_renders(&root, cx);
         assert!(inner_after_refresh > inner_when_nested);
+    }
+
+    #[gpui::test]
+    fn nested_view_caching_redraws_a_view_whose_ancestor_was_reused(cx: &mut TestAppContext) {
+        let (root, cx) = redraw_scope_window(cx);
+        let (sidebar, pane) =
+            root.read_with(cx, |root, _| (root.sidebar.clone(), root.pane.clone()));
+        cx.update(|_, cx| cx.set_nested_view_caching(true));
+        let (_, _, inner) = redraw_scope_renders(&root, cx);
+
+        // A frame that reuses the pane whole moves the inner view's output,
+        // so the next redraw of the pane has to draw the inner view again.
+        sidebar.update(cx, |_, cx| cx.notify());
+        let (_, _, inner_after_sidebar) = redraw_scope_renders(&root, cx);
+        assert_eq!(inner_after_sidebar, inner);
+
+        pane.update(cx, |_, cx| cx.notify());
+        let (_, _, inner_after_pane) = redraw_scope_renders(&root, cx);
+        assert_eq!(inner_after_pane, inner + 1);
+
+        pane.update(cx, |_, cx| cx.notify());
+        let (_, _, inner_after_second_pane) = redraw_scope_renders(&root, cx);
+        assert_eq!(inner_after_second_pane, inner_after_pane);
     }
 }
 

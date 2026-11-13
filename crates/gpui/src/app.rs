@@ -1432,6 +1432,9 @@ impl App {
     /// window is refreshed. A view that draws from state it does not own must
     /// then observe that state and notify, exactly as a cached view inside an
     /// uncached parent already has to.
+    ///
+    /// The view is still redrawn once when the cached view that contains it
+    /// is redrawn after having been reused whole.
     pub fn set_nested_view_caching(&mut self, enabled: bool) {
         self.nested_view_caching = enabled;
     }
