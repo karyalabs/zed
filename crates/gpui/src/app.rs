@@ -1446,11 +1446,18 @@ impl App {
     /// origin changed is redrawn.
     ///
     /// When on, the view's last output is replayed at the new position as long
-    /// as it was entirely visible, moved by a whole number of device pixels,
-    /// and holds neither the pointer, the focus, a deferred element nor a text
-    /// input. Anything the view recorded from its absolute position while it
-    /// drew stays as it was until the view is drawn again, which happens
-    /// before a mouse event is dispatched inside it.
+    /// as it moved by a whole number of device pixels, the pointer is over the
+    /// same parts of it as before, and it holds neither the focus, a deferred
+    /// element, a tooltip nor a text input. To make that possible, a cached
+    /// view that is cut off by its container is drawn whole, and only shown
+    /// inside of the container.
+    ///
+    /// Anything the view recorded from its absolute position while it drew
+    /// stays as it was until the view is drawn again, which happens before a
+    /// mouse event other than a scroll is dispatched inside it.
+    ///
+    /// A view is also kept from the frame it was drawn in uncached, so that
+    /// caching it on the next frame does not draw it a second time.
     pub fn set_moved_view_reuse(&mut self, enabled: bool) {
         self.moved_view_reuse = enabled;
     }

@@ -638,30 +638,6 @@ fn prepaint_view(
                 let opacity = window.element_opacity();
                 let view_mask = window.view_mask(bounds, cx);
 
-                let reason = match element_state.as_ref() {
-                    None => 0,
-                    Some(state) => {
-                        if state.cache_key.content_mask != content_mask {
-                            1
-                        } else if state.cache_key.text_style != text_style {
-                            2
-                        } else if state.cache_key.opacity.to_bits() != opacity.to_bits() {
-                            3
-                        } else if window.dirty_views.contains(&entity_id) {
-                            4
-                        } else if window.refreshing {
-                            5
-                        } else if state.rendered_range(window).is_none() {
-                            if state.frame == window.frame_number {
-                                6
-                            } else {
-                                7
-                            }
-                        } else {
-                            8
-                        }
-                    }
-                };
                 // Opacity is compared by bits so that a NaN opacity still matches itself
                 // and the view keeps using its cache.
                 if let Some(mut element_state) = element_state
@@ -689,10 +665,6 @@ fn prepaint_view(
                             from: rendered_mask,
                             to: view_mask,
                         });
-                    if translation.is_none() {
-                        crate::moved_stats::PLAIN
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
                     let prepaint_range = window.prepaint_with_view_mask(view_mask, |window| {
                         let prepaint_start = window.prepaint_index();
                         window.reuse_prepaint(rendered_range.clone(), translation);
@@ -715,8 +687,6 @@ fn prepaint_view(
                     return (None, element_state);
                 }
 
-                crate::moved_stats::RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                crate::moved_stats::MISS[reason].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let refreshing = window.refreshing;
                 window.refreshing |= !cx.nested_view_caching;
                 let (prepaint_range, (element, accessed_entities)) = window

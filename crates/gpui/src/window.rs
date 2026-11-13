@@ -4354,60 +4354,40 @@ impl Window {
         }
     }
 
-    /// Whether a cached view drawn at `rendered_bounds` in the rendered frame
-    /// can be replayed at `bounds` instead of being drawn again.
+    /// Whether a cached view drawn at `rendered_bounds` under `rendered_mask` in
+    /// the rendered frame can be replayed at `bounds` under `view_mask` instead
+    /// of being drawn again.
     pub(crate) fn can_reuse_moved_view(
         &self,
         prepaint_range: &Range<PrepaintStateIndex>,
         paint_range: &Range<PaintIndex>,
         rendered_bounds: Bounds<Pixels>,
         bounds: Bounds<Pixels>,
-        content_mask: &ContentMask<Pixels>,
+        rendered_mask: &ContentMask<Pixels>,
         view_mask: ContentMask<Pixels>,
     ) -> bool {
-        let reason = self.moved_view_decline_reason(
-            prepaint_range,
-            paint_range,
-            rendered_bounds,
-            bounds,
-            content_mask,
-            view_mask,
-        );
-        crate::moved_stats::record(reason);
-        reason == 0
-    }
-
-    fn moved_view_decline_reason(
-        &self,
-        prepaint_range: &Range<PrepaintStateIndex>,
-        paint_range: &Range<PaintIndex>,
-        rendered_bounds: Bounds<Pixels>,
-        bounds: Bounds<Pixels>,
-        content_mask: &ContentMask<Pixels>,
-        view_mask: ContentMask<Pixels>,
-    ) -> usize {
         if rendered_bounds.size != bounds.size || self.a11y.is_active() {
-            return 1;
+            return false;
         }
 
         // Output outside of the mask the view was drawn under was dropped, so
         // only a view that was drawn whole can be replayed elsewhere.
-        if rendered_bounds.intersect(&content_mask.bounds) != rendered_bounds {
-            return 2;
+        if rendered_bounds.intersect(&rendered_mask.bounds) != rendered_bounds {
+            return false;
         }
 
         // Glyphs are rasterized for a device pixel position, so a fractional
         // move would not match what drawing the view again produces.
         let offset = (bounds.origin - rendered_bounds.origin).scale(self.scale_factor());
         if offset.x.0.fract() != 0. || offset.y.0.fract() != 0. {
-            return 3;
+            return false;
         }
 
         // Hover styles depend on which of the view's hitboxes hold the pointer.
         if rendered_bounds.contains(&self.mouse_position) || bounds.contains(&self.mouse_position) {
             let translation = ViewTranslation {
                 offset: bounds.origin - rendered_bounds.origin,
-                from: *content_mask,
+                from: *rendered_mask,
                 to: view_mask,
             };
             let hitboxes = &self.rendered_frame.hitboxes
@@ -4422,7 +4402,7 @@ impl Window {
                     .intersect(&translation.apply_to_mask(hitbox.content_mask).bounds)
                     .contains(&self.mouse_position);
                 if was_under_pointer != is_under_pointer {
-                    return 4;
+                    return false;
                 }
             }
         }
@@ -4431,7 +4411,7 @@ impl Window {
             || prepaint_range.start.tooltips_index != prepaint_range.end.tooltips_index
             || paint_range.start.input_handlers_index != paint_range.end.input_handlers_index
         {
-            return 5;
+            return false;
         }
 
         // A focused element can act on positions it recorded while it drew,
@@ -4441,17 +4421,17 @@ impl Window {
             if (prepaint_range.start.dispatch_tree_index..prepaint_range.end.dispatch_tree_index)
                 .contains(&focus_index)
             {
-                return 6;
+                return false;
             }
         }
 
-        0
+        true
     }
 
     /// The content mask to draw a cached view under: wide enough to draw the
     /// whole view when part of it is hidden, so that its output can be
     /// replayed once it moves. The view is still only shown inside of the
-    /// current content mask; see [`Self::with_view_mask`].
+    /// current content mask; see [`Self::paint_with_view_mask`].
     pub(crate) fn view_mask(&self, bounds: Bounds<Pixels>, cx: &App) -> ContentMask<Pixels> {
         let content_mask = self.content_mask();
         // A view larger than what shows it would draw far more than is seen.
@@ -6559,7 +6539,7 @@ impl Window {
         // Scrolling is left out: its listeners go by hitbox, and the view under
         // the pointer would otherwise be drawn twice for every scroll.
         let mut redraw = false;
-        let moved_views = if event.is::<crate::ScrollWheelEvent>() {
+        let moved_views = if event.is::<crate::ScrollEvent>() {
             &[]
         } else {
             self.rendered_frame.moved_views.as_slice()
@@ -11198,7 +11178,7 @@ mod tests {
     fn moved_view_reuse_redraws_what_it_cannot_replay(cx: &mut TestAppContext) {
         let (rows, cx) = moved_rows_window(cx);
         cx.update(|_, cx| cx.set_moved_view_reuse(true));
-        let renders = moved_rows_renders(&rows, px(20.), cx);
+        moved_rows_renders(&rows, px(20.), cx);
 
         // The pointer is over where the first row moves to.
         cx.simulate_mouse_move(point(px(50.), px(30.)), None, crate::Modifiers::default());
@@ -11207,6 +11187,13 @@ mod tests {
         assert_eq!(
             renders_under_pointer,
             [renders_before_hover[0] + 1, renders_before_hover[1]]
+        );
+
+        // A row that moves under the pointer without the pointer entering or
+        // leaving any part of it is replayed.
+        assert_eq!(
+            moved_rows_renders(&rows, px(25.), cx),
+            renders_under_pointer
         );
     }
 
