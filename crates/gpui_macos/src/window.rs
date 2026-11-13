@@ -2145,6 +2145,13 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
+        let (potential, current) = this.native_window().screen().map_or((1.0, 1.0), |screen| {
+            (
+                screen.maximumPotentialExtendedDynamicRangeColorComponentValue() as f32,
+                screen.maximumExtendedDynamicRangeColorComponentValue() as f32,
+            )
+        });
+        this.renderer.set_edr_headroom(potential, current);
         this.renderer.draw(scene);
     }
 
