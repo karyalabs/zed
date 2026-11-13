@@ -1,4 +1,5 @@
 use crate::metal_atlas::MetalAtlas;
+use crate::surface_color::{SurfaceColor, SurfaceFormat, SurfacePlanes};
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use gpui::{
@@ -12,8 +13,8 @@ use objc2_core_foundation::{CFRetained, CGSize};
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceDisplayP3};
 use objc2_core_video::{
     CVMetalTexture, CVMetalTextureCache, CVMetalTextureGetTexture, CVPixelBufferGetHeight,
-    CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
-    CVPixelBufferGetWidthOfPlane, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVReturnSuccess,
+    CVPixelBufferGetHeightOfPlane, CVPixelBufferGetWidth,
+    CVPixelBufferGetWidthOfPlane, kCVReturnSuccess,
 };
 use objc2_foundation::{NSRange, NSString};
 #[cfg(target_os = "macos")]
@@ -150,6 +151,11 @@ pub struct MetalRenderer {
     path_intermediate_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     path_intermediate_msaa_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     path_sample_count: u32,
+    /// Whether the layer is tagged Display P3, which surface colour targets.
+    output_p3: bool,
+    /// The brightest value the window's screen can show now, in units of SDR
+    /// white. 1 until the platform reports more.
+    edr_headroom: f32,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -174,7 +180,10 @@ impl MetalRenderer {
         let device = Self::create_device()?;
         let layer = CAMetalLayer::new();
         Self::configure_layer(&layer, &device, transparent, use_display_p3);
-        Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
+        let mut renderer =
+            Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)?;
+        renderer.output_p3 = use_display_p3;
+        Ok(renderer)
     }
 
     /// Creates a renderer for a CAMetalLayer owned by a platform view, such as
@@ -438,6 +447,8 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            output_p3: false,
+            edr_headroom: 1.0,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
         })
@@ -1408,17 +1419,11 @@ impl MetalRenderer {
                 DevicePixels::from(CVPixelBufferGetHeight(image_buffer) as i32),
             );
 
-            let pixel_format = CVPixelBufferGetPixelFormatType(image_buffer);
-            anyhow::ensure!(
-                pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                "unsupported surface pixel format: {pixel_format:#x}"
-            );
+            let format = SurfaceFormat::of(image_buffer, self.output_p3, self.edr_headroom)?;
 
-            let plane_texture = |plane, format| -> Result<CFRetained<CVMetalTexture>> {
-                let width = CVPixelBufferGetWidthOfPlane(image_buffer, plane);
-                let height = CVPixelBufferGetHeightOfPlane(image_buffer, plane);
+            let plane_texture = |plane, format, width, height| -> Result<CFRetained<CVMetalTexture>> {
                 let mut texture = ptr::null_mut();
-                // SAFETY: The buffer has two planes matching these formats and dimensions, and the output pointer is writable.
+                // SAFETY: The buffer has this plane in this format and these dimensions, and the output pointer is writable.
                 let status = unsafe {
                     CVMetalTextureCache::create_texture_from_image(
                         None,
@@ -1441,20 +1446,46 @@ impl MetalRenderer {
                 // SAFETY: The successful create call transfers ownership of this non-null texture.
                 Ok(unsafe { CFRetained::from_raw(texture) })
             };
-            let y_texture = plane_texture(0, MTLPixelFormat::R8Unorm)?;
-            let cb_cr_texture = plane_texture(1, MTLPixelFormat::RG8Unorm)?;
+            let (y_texture, cb_cr_texture) = match format.planes {
+                SurfacePlanes::BiPlanar(luma, chroma) => {
+                    let plane = |index, pixel_format| {
+                        plane_texture(
+                            index,
+                            pixel_format,
+                            CVPixelBufferGetWidthOfPlane(image_buffer, index),
+                            CVPixelBufferGetHeightOfPlane(image_buffer, index),
+                        )
+                    };
+                    (plane(0, luma)?, plane(1, chroma)?)
+                }
+                SurfacePlanes::Packed(pixel_format) => {
+                    let texture = plane_texture(
+                        0,
+                        pixel_format,
+                        CVPixelBufferGetWidth(image_buffer),
+                        CVPixelBufferGetHeight(image_buffer),
+                    )?;
+                    (texture.clone(), texture)
+                }
+            };
             let y_metal_texture =
                 CVMetalTextureGetTexture(&y_texture).context("retrieving luma Metal texture")?;
             let cb_cr_metal_texture = CVMetalTextureGetTexture(&cb_cr_texture)
                 .context("retrieving chroma Metal texture")?;
+            let color: SurfaceColor = format.color;
 
-            // SAFETY: The size is copied from a live value, and both planes match their shader texture slots.
+            // SAFETY: The size and colour are copied from live values, and both planes match their shader texture slots.
             // The frame completion handler retains the CoreVideo wrappers until GPU reads finish.
             unsafe {
                 command_encoder.setVertexBytes_length_atIndex(
                     ptr::NonNull::from(&texture_size).cast(),
                     mem::size_of_val(&texture_size),
                     SurfaceInputIndex::TextureSize as usize,
+                );
+                command_encoder.setFragmentBytes_length_atIndex(
+                    ptr::NonNull::from(&color).cast(),
+                    mem::size_of_val(&color),
+                    SurfaceInputIndex::Color as usize,
                 );
                 command_encoder.setFragmentTexture_atIndex(
                     Some(&y_metal_texture),
@@ -1864,6 +1895,7 @@ enum SurfaceInputIndex {
     TextureSize = 3,
     YTexture = 4,
     CbCrTexture = 5,
+    Color = 6,
 }
 
 #[repr(C)]

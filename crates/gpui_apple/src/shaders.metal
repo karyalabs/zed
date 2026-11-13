@@ -881,22 +881,125 @@ vertex SurfaceVertexOutput surface_vertex(
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+// Colour description of one surface, written by `SurfaceColor` in
+// metal_renderer.rs. Keep the two layouts identical.
+struct SurfaceColor {
+  // Columns applied to (y, cb, cr, 1) as sampled; folds in the range offsets.
+  float4 ycbcr_to_rgb[4];
+  // Rows of the linear source-to-output primaries matrix (xyz used).
+  float4 to_output_primaries[3];
+  // 0: legacy (no colour management), 1: SDR, 2: PQ, 3: HLG.
+  uint transfer;
+  // 1 when the surface is already RGB (BGRA); the matrix is then unused.
+  uint is_rgb;
+  // Brightest value the target can show, in units of SDR white (1 for SDR).
+  float headroom;
+  // Brightest value in the content, in units of SDR white.
+  float content_peak;
+};
+
+constant float SURFACE_SDR_WHITE_NITS = 203.0;
+
+float3 surface_srgb_to_linear(float3 c) {
+  float3 a = abs(c);
+  float3 lin = select(pow((a + 0.055) / 1.055, 2.4), a / 12.92, a <= 0.04045);
+  return sign(c) * lin;
+}
+
+// Extended sRGB encoding: values above 1 continue the curve.
+float3 surface_linear_to_srgb(float3 c) {
+  float3 a = abs(c);
+  float3 enc =
+      select(1.055 * pow(a, 1.0 / 2.4) - 0.055, a * 12.92, a <= 0.0031308);
+  return sign(c) * enc;
+}
+
+// SMPTE ST 2084 EOTF, returning nits.
+float3 surface_pq_to_nits(float3 e) {
+  const float m1 = 0.1593017578125;
+  const float m2 = 78.84375;
+  const float c1 = 0.8359375;
+  const float c2 = 18.8515625;
+  const float c3 = 18.6875;
+  float3 p = pow(clamp(e, 0.0, 1.0), 1.0 / m2);
+  return 10000.0 * pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1);
+}
+
+// ITU-R BT.2100 HLG: inverse OETF, then the reference OOTF for a 1000 nit
+// display, returning nits. `rgb_to_y` is the luminance row of the source.
+float3 surface_hlg_to_nits(float3 e, float3 rgb_to_y) {
+  const float a = 0.17883277;
+  const float b = 0.28466892;
+  const float c = 0.55991073;
+  float3 x = clamp(e, 0.0, 1.0);
+  float3 scene = select((exp((x - c) / a) + b) / 12.0, x * x / 3.0, x <= 0.5);
+  float ys = max(dot(rgb_to_y, scene), 1e-6);
+  return 1000.0 * scene * pow(ys, 1.2 - 1.0);
+}
+
+// Rolls values above a knee off so that `peak` lands on `headroom`, keeping
+// the hue by scaling all channels by the same factor.
+float3 surface_tone_map(float3 rgb, float headroom, float peak) {
+  if (peak <= headroom) {
+    return rgb;
+  }
+  float knee = 0.75 * headroom;
+  float m = max(max(rgb.r, rgb.g), rgb.b);
+  if (m <= knee) {
+    return rgb;
+  }
+  float s = (m - knee) / (headroom - knee);
+  float w = (peak - knee) / (headroom - knee);
+  float mapped =
+      knee + (headroom - knee) * (s * (1.0 + s / (w * w)) / (1.0 + s));
+  return rgb * (min(mapped, headroom) / m);
+}
+
 fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
-                                 [[texture(SurfaceInputIndex_CbCrTexture)]]) {
+                                 [[texture(SurfaceInputIndex_CbCrTexture)]],
+                                 constant SurfaceColor *color
+                                 [[buffer(SurfaceInputIndex_Color)]]) {
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
-  const float4x4 ycbcrToRGBTransform =
-      float4x4(float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),
-               float4(+0.0000f, -0.3441f, +1.7720f, +0.0000f),
-               float4(+1.4020f, -0.7141f, +0.0000f, +0.0000f),
-               float4(-0.7010f, +0.5291f, -0.8860f, +1.0000f));
-  float4 ycbcr = float4(
-      y_texture.sample(texture_sampler, input.texture_position).r,
-      cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
+  float4 first = y_texture.sample(texture_sampler, input.texture_position);
+  float3 rgb;
+  if (color->is_rgb != 0) {
+    rgb = first.rgb;
+  } else {
+    float4 ycbcr = float4(
+        first.r,
+        cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
+    float4x4 to_rgb = float4x4(color->ycbcr_to_rgb[0], color->ycbcr_to_rgb[1],
+                               color->ycbcr_to_rgb[2], color->ycbcr_to_rgb[3]);
+    rgb = (to_rgb * ycbcr).rgb;
+  }
 
-  return ycbcrToRGBTransform * ycbcr;
+  if (color->transfer == 0) {
+    return float4(rgb, 1.0);
+  }
+
+  // float3x3 takes columns; the Rust side writes rows.
+  float3x3 to_output = transpose(float3x3(color->to_output_primaries[0].xyz,
+                                          color->to_output_primaries[1].xyz,
+                                          color->to_output_primaries[2].xyz));
+  float3 linear_rgb;
+  if (color->transfer == 1) {
+    linear_rgb = to_output * surface_srgb_to_linear(clamp(rgb, 0.0, 1.0));
+    linear_rgb = clamp(linear_rgb, 0.0, 1.0);
+  } else {
+    // HLG's OOTF needs the source's luminance row; BT.2020 is the only HDR
+    // source in practice.
+    float3 nits =
+        color->transfer == 2
+            ? surface_pq_to_nits(rgb)
+            : surface_hlg_to_nits(rgb, float3(0.2627, 0.6780, 0.0593));
+    linear_rgb = max(to_output * (nits / SURFACE_SDR_WHITE_NITS), 0.0);
+    linear_rgb =
+        surface_tone_map(linear_rgb, color->headroom, color->content_peak);
+  }
+  return float4(surface_linear_to_srgb(linear_rgb), 1.0);
 }
 
 float4 hsla_to_rgba(Hsla hsla) {
