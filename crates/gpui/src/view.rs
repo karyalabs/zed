@@ -8,7 +8,6 @@ use crate::{Empty, Window};
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
-use std::mem;
 use std::{
     any::{TypeId, type_name},
     fmt,
@@ -567,7 +566,8 @@ fn prepaint_view(
                     return (None, element_state);
                 }
 
-                let refreshing = mem::replace(&mut window.refreshing, true);
+                let refreshing = window.refreshing;
+                window.refreshing |= !cx.nested_view_caching;
                 let prepaint_start = window.prepaint_index();
                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                     let mut element = render(window, cx);
@@ -637,7 +637,8 @@ fn paint_view(
                     // actually painted, and output replayed under a different opacity is
                     // redrawn on the next frame.
                     if let Some(element) = element {
-                        let refreshing = mem::replace(&mut window.refreshing, true);
+                        let refreshing = window.refreshing;
+                        window.refreshing |= !cx.nested_view_caching;
                         let ((), accessed_entities) =
                             cx.detect_accessed_entities(|cx| element.paint(window, cx));
                         element_state.accessed_entities.extend(accessed_entities);
