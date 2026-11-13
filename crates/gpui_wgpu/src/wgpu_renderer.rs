@@ -84,6 +84,59 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    /// Columns of the YCbCr to RGB matrix, as `fs_surface` multiplies
+    /// `vec4(y, cb, cr, 1)` by it.
+    ycbcr_to_rgb: [[f32; 4]; 4],
+}
+
+/// The YCbCr to RGB matrix for a frame's colour, with the range expansion
+/// folded in, as columns.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn ycbcr_to_rgb(colour: gpui::VideoColour) -> [[f32; 4]; 4] {
+    let (kr, kb) = match colour.matrix {
+        gpui::VideoMatrix::Bt601 => (0.299, 0.114),
+        gpui::VideoMatrix::Bt709 => (0.2126, 0.0722),
+        gpui::VideoMatrix::Bt2020 => (0.2627, 0.0593),
+    };
+    let kg = 1.0 - kr - kb;
+    let (luma_offset, luma_scale, chroma_scale) = if colour.full_range {
+        (0.0, 1.0, 1.0)
+    } else {
+        (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0)
+    };
+    let luma = [luma_scale; 3];
+    let cb = [
+        0.0,
+        -2.0 * kb * (1.0 - kb) / kg * chroma_scale,
+        2.0 * (1.0 - kb) * chroma_scale,
+    ];
+    let cr = [
+        2.0 * (1.0 - kr) * chroma_scale,
+        -2.0 * kr * (1.0 - kr) / kg * chroma_scale,
+        0.0,
+    ];
+    let constant: [f32; 3] =
+        std::array::from_fn(|i| -(luma[i] * luma_offset + cb[i] * 0.5 + cr[i] * 0.5));
+    [
+        [luma[0], luma[1], luma[2], 0.0],
+        [cb[0], cb[1], cb[2], 0.0],
+        [cr[0], cr[1], cr[2], 0.0],
+        [constant[0], constant[1], constant[2], 1.0],
+    ]
+}
+
+/// The textures of one video frame drawn by the last frame, kept so that a
+/// redraw of the same video frame uploads nothing and the next frame of the
+/// same size reuses them.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+struct VideoFrameTextures {
+    frame_id: u64,
+    size: (u32, u32),
+    luma: wgpu::Texture,
+    chroma: wgpu::Texture,
+    params: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    used: bool,
 }
 
 #[repr(C)]
@@ -194,6 +247,10 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    video_sampler: wgpu::Sampler,
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    video_frames: Vec<VideoFrameTextures>,
 }
 
 struct CachedTextureBindGroup {
@@ -1265,6 +1322,13 @@ impl WgpuRendererCore {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let video_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("video_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
         let gamma_size = std::mem::size_of::<GammaParams>() as u64;
@@ -1377,6 +1441,10 @@ impl WgpuRendererCore {
                 path_intermediate_view: None,
                 path_msaa_texture: None,
                 path_msaa_view: None,
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                video_sampler,
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                video_frames: Vec::new(),
             },
             atlas,
             path_globals_offset,
@@ -1521,6 +1589,8 @@ impl WgpuRendererCore {
                 )
             })?;
         self.prepare_texture_bind_groups(scene);
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let video_frames = self.prepare_video_frames(scene);
 
         let mut encoder =
             self.resources()
@@ -1633,8 +1703,22 @@ impl WgpuRendererCore {
                             &mut pass,
                         )?;
                     }
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                    PrimitiveBatch::Surfaces(range) => {
+                        let resources = self.resources();
+                        for index in range {
+                            let Some(Some(textures)) = video_frames.get(index) else {
+                                continue;
+                            };
+                            let textures = &resources.video_frames[*textures];
+                            pass.set_pipeline(&resources.pipelines.surfaces);
+                            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+                            pass.set_bind_group(1, &textures.bind_group, &[]);
+                            pass.draw(0..4, 0..1);
+                        }
+                    }
+                    // Apple platforms draw surfaces with their own renderer.
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     PrimitiveBatch::Surfaces(_surfaces) => {}
                 }
             }
@@ -1645,6 +1729,212 @@ impl WgpuRendererCore {
             .queue
             .submit(std::iter::once(encoder.finish()));
         Ok(submission)
+    }
+
+    /// Uploads the scene's video frames that are not on the GPU yet and
+    /// returns, for each of `scene.surfaces`, the index of its textures in
+    /// `video_frames` (`None` when it cannot be drawn).
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    fn prepare_video_frames(&mut self, scene: &Scene) -> Vec<Option<usize>> {
+        let max_texture_size = self.max_texture_size;
+        let resources = &mut self.resources;
+        for textures in &mut resources.video_frames {
+            textures.used = false;
+        }
+        let wanted: collections::FxHashSet<u64> = scene
+            .surfaces
+            .iter()
+            .map(|surface| surface.video_frame.id())
+            .collect();
+        let mut indices = Vec::with_capacity(scene.surfaces.len());
+        for surface in &scene.surfaces {
+            let frame = &surface.video_frame;
+            let size = frame.size();
+            let size = (size.width, size.height);
+            if size.0 > max_texture_size || size.1 > max_texture_size {
+                log::error!("video frame {size:?} is larger than the GPU's textures");
+                indices.push(None);
+                continue;
+            }
+            let index = resources
+                .video_frames
+                .iter()
+                .position(|textures| !textures.used && textures.frame_id == frame.id())
+                .or_else(|| {
+                    resources.video_frames.iter().position(|textures| {
+                        !textures.used
+                            && textures.size == size
+                            && !wanted.contains(&textures.frame_id)
+                    })
+                })
+                .unwrap_or_else(|| {
+                    let textures = Self::create_video_frame_textures(resources, size);
+                    resources.video_frames.push(textures);
+                    resources.video_frames.len() - 1
+                });
+            let textures = &mut resources.video_frames[index];
+            if textures.frame_id != frame.id() {
+                Self::upload_video_frame(&resources.queue, textures, frame);
+                textures.frame_id = frame.id();
+            }
+            textures.used = true;
+            let params = SurfaceParams {
+                bounds: surface.bounds.into(),
+                content_mask: surface.content_mask.bounds.into(),
+                ycbcr_to_rgb: ycbcr_to_rgb(frame.colour()),
+            };
+            resources
+                .queue
+                .write_buffer(&textures.params, 0, bytemuck::bytes_of(&params));
+            indices.push(Some(index));
+        }
+        // Keep a spare set of textures for the next frame of each video, and
+        // let go of the rest, so a video that stopped frees its memory.
+        let mut spares = 0;
+        let mut position = 0;
+        let mut remap = Vec::with_capacity(resources.video_frames.len());
+        resources.video_frames.retain(|textures| {
+            let keep = textures.used || {
+                spares += 1;
+                spares <= indices.len().max(1)
+            };
+            remap.push(keep.then_some(position));
+            if keep {
+                position += 1;
+            }
+            keep
+        });
+        indices
+            .into_iter()
+            .map(|index| index.and_then(|index| remap[index]))
+            .collect()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    fn create_video_frame_textures(
+        resources: &WgpuResources,
+        (width, height): (u32, u32),
+    ) -> VideoFrameTextures {
+        let device = &resources.device;
+        let plane = |label, format, width, height| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let luma = plane("video_luma", wgpu::TextureFormat::R8Unorm, width, height);
+        let chroma = plane(
+            "video_chroma",
+            wgpu::TextureFormat::Rg8Unorm,
+            width.div_ceil(2),
+            height.div_ceil(2),
+        );
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("video_params"),
+            size: std::mem::size_of::<SurfaceParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("video_bind_group"),
+            layout: &resources.bind_group_layouts.surfaces,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(
+                        &luma.create_view(&wgpu::TextureViewDescriptor::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(
+                        &chroma.create_view(&wgpu::TextureViewDescriptor::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&resources.video_sampler),
+                },
+            ],
+        });
+        VideoFrameTextures {
+            frame_id: 0,
+            size: (width, height),
+            luma,
+            chroma,
+            params,
+            bind_group,
+            used: false,
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    fn upload_video_frame(
+        queue: &wgpu::Queue,
+        textures: &VideoFrameTextures,
+        frame: &gpui::VideoFrame,
+    ) {
+        let (width, height) = textures.size;
+        let write = |texture: &wgpu::Texture, data: &[u8], stride: u32, width, height| {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+        match frame.planes() {
+            gpui::VideoPlanes::Nv12 {
+                data,
+                luma_offset,
+                luma_stride,
+                chroma_offset,
+                chroma_stride,
+            } => {
+                let data = (**data).as_ref();
+                // `VideoFrame::nv12` checked that both planes fit.
+                let (Some(luma), Some(chroma)) =
+                    (data.get(*luma_offset..), data.get(*chroma_offset..))
+                else {
+                    return;
+                };
+                write(&textures.luma, luma, *luma_stride, width, height);
+                write(
+                    &textures.chroma,
+                    chroma,
+                    *chroma_stride,
+                    width.div_ceil(2),
+                    height.div_ceil(2),
+                );
+            }
+        }
     }
 
     fn write_instances(
@@ -2719,6 +3009,78 @@ mod tests {
         assert_pixel(&image, 24, 16, RED);
         assert_pixel(&image, 40, 16, BLUE);
         assert_pixel(&image, 56, 16, BLUE);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn solid_video_frame(width: u32, height: u32, y: u8, cb: u8, cr: u8) -> Arc<gpui::VideoFrame> {
+        let colour = gpui::VideoColour {
+            matrix: gpui::VideoMatrix::Bt709,
+            full_range: false,
+        };
+        let luma_size = (width * height) as usize;
+        let mut data = vec![y; luma_size];
+        data.extend([cb, cr].repeat((width.div_ceil(2) * height.div_ceil(2)) as usize));
+        Arc::new(
+            gpui::VideoFrame::nv12(
+                width,
+                height,
+                colour,
+                data,
+                (0, width),
+                (luma_size, width.div_ceil(2) * 2),
+            )
+            .expect("valid frame"),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn video_surface(x: f32, width: f32, video_frame: Arc<gpui::VideoFrame>) -> gpui::PaintSurface {
+        let bounds = Bounds {
+            origin: Point {
+                x: x.into(),
+                y: 0.0.into(),
+            },
+            size: Size {
+                width: width.into(),
+                height: 32.0.into(),
+            },
+        };
+        gpui::PaintSurface {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            video_frame,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_renderer_draws_nv12_video_frames() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        // BT.709 limited range: pure red, and white.
+        let red = solid_video_frame(6, 4, 63, 102, 240);
+        let white = solid_video_frame(6, 4, 235, 128, 128);
+        let mut scene = Scene::default();
+        scene.insert_primitive(video_surface(0.0, 32.0, red));
+        scene.insert_primitive(video_surface(32.0, 32.0, white.clone()));
+        scene.finish();
+        let image = renderer.render_scene_to_image(&scene, device_size(64, 32))?;
+        assert_pixel(&image, 16, 16, RED);
+        assert_pixel(&image, 48, 16, [255, 255, 255, 255]);
+
+        // The same frames again (nothing uploaded), then a new frame of the
+        // same size in place of the red one (its textures are reused).
+        let image = renderer.render_scene_to_image(&scene, device_size(64, 32))?;
+        assert_pixel(&image, 16, 16, RED);
+        let black = solid_video_frame(6, 4, 16, 128, 128);
+        let mut scene = Scene::default();
+        scene.insert_primitive(video_surface(0.0, 32.0, black));
+        scene.insert_primitive(video_surface(32.0, 32.0, white));
+        scene.finish();
+        let image = renderer.render_scene_to_image(&scene, device_size(64, 32))?;
+        assert_pixel(&image, 16, 16, BLACK);
+        assert_pixel(&image, 48, 16, [255, 255, 255, 255]);
         Ok(())
     }
 

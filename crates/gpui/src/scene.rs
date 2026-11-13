@@ -771,6 +771,162 @@ pub struct PaintSurface {
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub image_buffer: objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>,
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub video_frame: std::sync::Arc<VideoFrame>,
+}
+
+/// A decoded video frame that the renderer samples as it is, converting YUV
+/// to RGB while drawing, so a player does not have to convert and copy each
+/// frame into an image first. Drawn with [`crate::Window::paint_video_frame`].
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[derive(Debug)]
+pub struct VideoFrame {
+    id: u64,
+    width: u32,
+    height: u32,
+    colour: VideoColour,
+    planes: VideoPlanes,
+}
+
+/// How a frame's YUV samples map to RGB.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct VideoColour {
+    /// The YUV to RGB matrix.
+    pub matrix: VideoMatrix,
+    /// True when samples use the full 0 to 255 range, false for the limited
+    /// (video) range of 16 to 235 for luma and 16 to 240 for chroma.
+    pub full_range: bool,
+}
+
+/// The YUV to RGB matrices a [`VideoFrame`] can use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VideoMatrix {
+    /// BT.601 (standard definition).
+    Bt601,
+    /// BT.709 (high definition), the usual matrix of video today.
+    #[default]
+    Bt709,
+    /// BT.2020 non-constant luminance (UHD and HDR).
+    Bt2020,
+}
+
+/// Where a [`VideoFrame`]'s samples are.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub enum VideoPlanes {
+    /// 8-bit 4:2:0 in memory: a full size luma plane, then a half size plane
+    /// of interleaved Cb and Cr, both in `data`. Offsets and strides are in
+    /// bytes.
+    Nv12 {
+        /// The memory holding both planes, such as a decoder's buffer kept
+        /// mapped until the frame is dropped, so the frame needs no copy.
+        data: Box<dyn AsRef<[u8]> + Send + Sync>,
+        /// Where the luma plane starts.
+        luma_offset: usize,
+        /// Bytes from one luma row to the next.
+        luma_stride: u32,
+        /// Where the chroma plane starts.
+        chroma_offset: usize,
+        /// Bytes from one chroma row to the next.
+        chroma_stride: u32,
+    },
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+impl std::fmt::Debug for VideoPlanes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Nv12 {
+                data,
+                luma_stride,
+                chroma_stride,
+                ..
+            } => formatter
+                .debug_struct("Nv12")
+                .field("bytes", &(**data).as_ref().len())
+                .field("luma_stride", luma_stride)
+                .field("chroma_stride", chroma_stride)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+impl VideoFrame {
+    /// An NV12 frame in memory: both planes in `data`, at the given offsets
+    /// and strides. Fails when a plane does not fit in `data`.
+    pub fn nv12(
+        width: u32,
+        height: u32,
+        colour: VideoColour,
+        data: impl AsRef<[u8]> + Send + Sync + 'static,
+        (luma_offset, luma_stride): (usize, u32),
+        (chroma_offset, chroma_stride): (usize, u32),
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(width > 0 && height > 0, "empty video frame");
+        let chroma_width = width.div_ceil(2) * 2;
+        anyhow::ensure!(
+            luma_stride >= width && chroma_stride >= chroma_width,
+            "video frame stride too small: {luma_stride}/{chroma_stride} for width {width}"
+        );
+        let plane_end = |offset: usize, stride: u32, rows: u32, row: u32| {
+            offset as u64 + stride as u64 * (rows as u64 - 1) + row as u64
+        };
+        let length = data.as_ref().len() as u64;
+        anyhow::ensure!(
+            plane_end(luma_offset, luma_stride, height, width) <= length
+                && plane_end(
+                    chroma_offset,
+                    chroma_stride,
+                    height.div_ceil(2),
+                    chroma_width
+                ) <= length,
+            "video frame planes do not fit in {length} bytes at {width}x{height}"
+        );
+        Ok(Self {
+            id: next_video_frame_id(),
+            width,
+            height,
+            colour,
+            planes: VideoPlanes::Nv12 {
+                data: Box::new(data),
+                luma_offset,
+                luma_stride,
+                chroma_offset,
+                chroma_stride,
+            },
+        })
+    }
+
+    /// Unique for every frame made in this process, so a renderer can tell a
+    /// frame it has already uploaded from a new one.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The frame's size in pixels.
+    pub fn size(&self) -> Size<u32> {
+        Size {
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    /// How the frame's samples map to RGB.
+    pub fn colour(&self) -> VideoColour {
+        self.colour
+    }
+
+    /// The frame's samples.
+    pub fn planes(&self) -> &VideoPlanes {
+        &self.planes
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn next_video_frame_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl From<PaintSurface> for Primitive {
