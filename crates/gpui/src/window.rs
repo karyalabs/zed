@@ -5465,6 +5465,32 @@ impl Window {
         Ok(())
     }
 
+    /// Paint a decoded video frame into the scene for the next frame at the
+    /// current z-index, stretched to `bounds`. The renderer converts it from
+    /// YUV while drawing; keep the `Arc` and paint it again to redraw the same
+    /// frame without uploading it again.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub fn paint_video_frame(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        video_frame: std::sync::Arc<crate::VideoFrame>,
+    ) {
+        use crate::PaintSurface;
+
+        self.invalidator.debug_assert_paint();
+
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            video_frame,
+        });
+    }
+
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
