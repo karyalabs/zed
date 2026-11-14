@@ -653,6 +653,9 @@ impl WgpuContext {
         surface: &wgpu::Surface<'_>,
         config: &WgpuSurfaceConfig,
     ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool, TextureFormat)> {
+        if !Self::adapter_can_present(adapter) {
+            anyhow::bail!("the Vulkan device does not support VK_KHR_swapchain");
+        }
         let caps = surface.get_capabilities(adapter);
         if caps.formats.is_empty() {
             anyhow::bail!("no compatible surface formats");
@@ -682,6 +685,31 @@ impl WgpuContext {
             dual_source_blending,
             color_atlas_texture_format,
         ))
+    }
+
+    /// Whether the adapter's device can present to a surface at all.
+    ///
+    /// A Vulkan device without `VK_KHR_swapchain` can still report surface
+    /// capabilities (they are queried through the instance), but configuring
+    /// the surface then panics inside ash instead of returning an error, so
+    /// the loop above never gets to try the next adapter. Compute-only
+    /// drivers do this: Venus in a krunkit or libkrun VM on macOS exposes the
+    /// host GPU without swapchain support, ahead of llvmpipe in the order.
+    #[cfg(not(target_family = "wasm"))]
+    fn adapter_can_present(adapter: &wgpu::Adapter) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            // SAFETY: the HAL adapter is only read, and the guard is dropped
+            // before this function returns.
+            let vulkan = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() };
+            if let Some(vulkan) = vulkan {
+                return vulkan
+                    .physical_device_capabilities()
+                    .supports_extension(c"VK_KHR_swapchain");
+            }
+        }
+        let _ = adapter;
+        true
     }
 
     fn select_color_texture_format(adapter: &wgpu::Adapter) -> anyhow::Result<wgpu::TextureFormat> {
