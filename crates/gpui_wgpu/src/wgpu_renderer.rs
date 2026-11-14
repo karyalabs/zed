@@ -137,6 +137,12 @@ struct VideoFrameTextures {
     params: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     used: bool,
+    /// Frames drawn since these textures were last used.
+    idle_frames: u8,
+    /// For textures imported from a frame's dmabufs: the frame, which keeps
+    /// its buffers from being reused while the GPU may still read them.
+    /// Such textures belong to that frame and are never written.
+    imported: Option<Arc<gpui::VideoFrame>>,
 }
 
 #[repr(C)]
@@ -251,6 +257,9 @@ struct WgpuResources {
     video_sampler: wgpu::Sampler,
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     video_frames: Vec<VideoFrameTextures>,
+    /// Set after the first failed dmabuf import, so the error is logged once.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    video_import_failed: bool,
 }
 
 struct CachedTextureBindGroup {
@@ -1445,6 +1454,8 @@ impl WgpuRendererCore {
                 video_sampler,
                 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                 video_frames: Vec::new(),
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                video_import_failed: false,
             },
             atlas,
             path_globals_offset,
@@ -1761,17 +1772,40 @@ impl WgpuRendererCore {
                 .iter()
                 .position(|textures| !textures.used && textures.frame_id == frame.id())
                 .or_else(|| {
+                    if Self::is_dmabuf(frame) {
+                        return None;
+                    }
                     resources.video_frames.iter().position(|textures| {
                         !textures.used
+                            && textures.imported.is_none()
                             && textures.size == size
                             && !wanted.contains(&textures.frame_id)
                     })
-                })
-                .unwrap_or_else(|| {
+                });
+            let index = match index {
+                Some(index) => index,
+                None if Self::is_dmabuf(frame) => {
+                    match Self::import_video_frame(resources, frame) {
+                        Ok(textures) => {
+                            resources.video_frames.push(textures);
+                            resources.video_frames.len() - 1
+                        }
+                        Err(error) => {
+                            if !resources.video_import_failed {
+                                log::error!("cannot import a dmabuf video frame: {error:#}");
+                                resources.video_import_failed = true;
+                            }
+                            indices.push(None);
+                            continue;
+                        }
+                    }
+                }
+                None => {
                     let textures = Self::create_video_frame_textures(resources, size);
                     resources.video_frames.push(textures);
                     resources.video_frames.len() - 1
-                });
+                }
+            };
             let textures = &mut resources.video_frames[index];
             if textures.frame_id != frame.id() {
                 Self::upload_video_frame(&resources.queue, textures, frame);
@@ -1793,10 +1827,21 @@ impl WgpuRendererCore {
         let mut spares = 0;
         let mut position = 0;
         let mut remap = Vec::with_capacity(resources.video_frames.len());
-        resources.video_frames.retain(|textures| {
-            let keep = textures.used || {
-                spares += 1;
-                spares <= indices.len().max(1)
+        resources.video_frames.retain_mut(|textures| {
+            textures.idle_frames = if textures.used {
+                0
+            } else {
+                textures.idle_frames.saturating_add(1)
+            };
+            let keep = if textures.imported.is_some() {
+                // Imported textures cannot take another frame, but stay one
+                // frame longer so their buffers outlive the GPU's last read.
+                textures.idle_frames <= 1
+            } else {
+                textures.used || {
+                    spares += 1;
+                    spares <= indices.len().max(1)
+                }
             };
             remap.push(keep.then_some(position));
             if keep {
@@ -1839,6 +1884,17 @@ impl WgpuRendererCore {
             width.div_ceil(2),
             height.div_ceil(2),
         );
+        Self::video_frame_textures(resources, (width, height), luma, chroma)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    fn video_frame_textures(
+        resources: &WgpuResources,
+        size: (u32, u32),
+        luma: wgpu::Texture,
+        chroma: wgpu::Texture,
+    ) -> VideoFrameTextures {
+        let device = &resources.device;
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("video_params"),
             size: std::mem::size_of::<SurfaceParams>() as u64,
@@ -1873,13 +1929,142 @@ impl WgpuRendererCore {
         });
         VideoFrameTextures {
             frame_id: 0,
-            size: (width, height),
+            size,
             luma,
             chroma,
             params,
             bind_group,
             used: false,
+            idle_frames: 0,
+            imported: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_dmabuf(frame: &gpui::VideoFrame) -> bool {
+        matches!(frame.planes(), gpui::VideoPlanes::Nv12Dmabuf { .. })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+    fn is_dmabuf(_frame: &gpui::VideoFrame) -> bool {
+        false
+    }
+
+    /// Wraps a dmabuf frame's planes as textures, with no copy.
+    #[cfg(target_os = "linux")]
+    fn import_video_frame(
+        resources: &WgpuResources,
+        frame: &Arc<gpui::VideoFrame>,
+    ) -> anyhow::Result<VideoFrameTextures> {
+        let gpui::VideoPlanes::Nv12Dmabuf {
+            luma,
+            chroma,
+            modifier,
+            ..
+        } = frame.planes()
+        else {
+            anyhow::bail!("not a dmabuf frame");
+        };
+        anyhow::ensure!(
+            resources
+                .device
+                .features()
+                .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF),
+            "the GPU device cannot import dmabufs"
+        );
+        let size = frame.size();
+        let luma = Self::import_dmabuf_plane(
+            &resources.device,
+            luma,
+            *modifier,
+            wgpu::TextureFormat::R8Unorm,
+            (size.width, size.height),
+        )?;
+        let chroma = Self::import_dmabuf_plane(
+            &resources.device,
+            chroma,
+            *modifier,
+            wgpu::TextureFormat::Rg8Unorm,
+            (size.width.div_ceil(2), size.height.div_ceil(2)),
+        )?;
+        let mut textures =
+            Self::video_frame_textures(resources, (size.width, size.height), luma, chroma);
+        textures.frame_id = frame.id();
+        textures.imported = Some(frame.clone());
+        Ok(textures)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+    fn import_video_frame(
+        _resources: &WgpuResources,
+        _frame: &Arc<gpui::VideoFrame>,
+    ) -> anyhow::Result<VideoFrameTextures> {
+        anyhow::bail!("dmabuf frames exist only on Linux")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn import_dmabuf_plane(
+        device: &wgpu::Device,
+        plane: &gpui::DmabufPlane,
+        modifier: u64,
+        format: wgpu::TextureFormat,
+        (width, height): (u32, u32),
+    ) -> anyhow::Result<wgpu::Texture> {
+        use anyhow::Context as _;
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        // Vulkan takes ownership of the descriptor it imports.
+        let fd = plane.fd.try_clone().context("duplicating the dmabuf")?;
+        let hal_descriptor = wgpu::hal::TextureDescriptor {
+            label: Some("video_dmabuf_plane"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUses::RESOURCE,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: Vec::new(),
+        };
+        // SAFETY: the descriptor, modifier, stride and offset come from the
+        // decoder that made the dmabuf, and the frame that owns it outlives
+        // the texture's last use (see `VideoFrameTextures::imported`).
+        let hal_texture = unsafe {
+            let hal_device = device
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .context("the GPU device is not Vulkan")?;
+            hal_device
+                .texture_from_dmabuf_fd(
+                    fd,
+                    &hal_descriptor,
+                    modifier,
+                    plane.stride as u64,
+                    plane.offset as u64,
+                )
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+        };
+        // SAFETY: a texture just made on this device, matching the
+        // descriptor, never written by us and fully defined by the decoder.
+        Ok(unsafe {
+            device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                hal_texture,
+                &wgpu::TextureDescriptor {
+                    label: Some("video_dmabuf_plane"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+                wgpu::TextureUses::RESOURCE,
+                true,
+            )
+        })
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -1934,6 +2119,9 @@ impl WgpuRendererCore {
                     height.div_ceil(2),
                 );
             }
+            // Imported, never uploaded (`import_video_frame`).
+            #[cfg(target_os = "linux")]
+            gpui::VideoPlanes::Nv12Dmabuf { .. } => {}
         }
     }
 

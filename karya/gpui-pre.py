@@ -15,7 +15,9 @@ Only crates this branch changes are written; every other gpui-pre crate keeps
 coming from crates.io. A change to a crate's Cargo.toml cannot be mapped
 (gpui-pre rewrites manifests), so it stops the script: put manifest edits in
 karya/manifests/<gpui-pre crate>.toml.patch instead (a unified diff against
-the gpui-pre manifest).
+the gpui-pre manifest). Source edits that only the gpui-pre build needs
+(gpui-pre pins wgpu from crates.io, Zed a git revision) go in
+karya/sources/<gpui-pre crate>.patch, applied after our diff.
 """
 
 import argparse
@@ -131,6 +133,13 @@ def main() -> None:
         manifest_patch = ROOT / "karya" / "manifests" / f"{name}.toml.patch"
         if manifest_patch.exists():
             apply(manifest_patch.read_text(), dest, strip=1)
+        # Where gpui-pre pins a different version of a dependency than Zed
+        # (wgpu from crates.io instead of Zed's git revision), our code may
+        # need a small edit to build there: a unified diff against the
+        # patched crate.
+        source_patch = ROOT / "karya" / "sources" / f"{name}.patch"
+        if source_patch.exists():
+            apply(source_patch.read_text(), dest, strip=1)
         print(f"  {zed_crate} -> {name} ({len(files)} files)")
 
     head = git("rev-parse", "HEAD").strip()

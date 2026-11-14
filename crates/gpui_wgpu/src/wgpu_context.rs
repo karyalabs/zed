@@ -439,6 +439,16 @@ impl WgpuContext {
             );
         }
 
+        // Lets video frames from hardware decoders be drawn from the
+        // decoder's memory (`VideoPlanes::Nv12Dmabuf`).
+        #[cfg(target_os = "linux")]
+        if adapter
+            .features()
+            .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF)
+        {
+            required_features |= wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
+        }
+
         let color_atlas_texture_format = Self::select_color_texture_format(adapter)?;
         #[cfg(target_family = "wasm")]
         let required_limits = if adapter.get_info().backend == wgpu::Backend::Gl {

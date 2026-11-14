@@ -1,0 +1,10 @@
+--- a/src/wgpu_renderer.rs	2026-11-14 21:49:19.665579664 +0000
++++ b/src/wgpu_renderer.rs	2026-11-14 21:49:19.660600584 +0000
+@@ -2063,7 +2063,6 @@
+                     view_formats: &[],
+                 },
+                 wgpu::TextureUses::RESOURCE,
+-                true,
+             )
+         })
+     }
