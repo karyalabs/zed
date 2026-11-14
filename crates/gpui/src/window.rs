@@ -1058,6 +1058,13 @@ pub(crate) struct Frame {
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
+    /// The cached views in this frame whose output was replayed at another
+    /// position than the one they were drawn at, with their bounds.
+    pub(crate) moved_views: Vec<(EntityId, Bounds<Pixels>)>,
+    /// Ranges of `hitboxes` that only take the pointer inside of a mask, on
+    /// top of their own content masks. These come from views drawn under a
+    /// wider mask than the one that shows them.
+    pub(crate) hitbox_clips: Vec<(Range<usize>, ContentMask<Pixels>)>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
@@ -1077,9 +1084,37 @@ pub(crate) struct PrepaintStateIndex {
     hitboxes_index: usize,
     tooltips_index: usize,
     deferred_draws_index: usize,
+    moved_views_index: usize,
+    hitbox_clips_index: usize,
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     line_layout_index: LineLayoutIndex,
+}
+
+/// How far a reused view moved since its output was drawn, the content mask
+/// it was drawn under, and the one that replaces it.
+#[derive(Clone, Copy)]
+pub(crate) struct ViewTranslation {
+    pub(crate) offset: Point<Pixels>,
+    pub(crate) from: ContentMask<Pixels>,
+    pub(crate) to: ContentMask<Pixels>,
+}
+
+impl ViewTranslation {
+    fn apply(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        bounds + self.offset
+    }
+
+    fn apply_to_mask(&self, mask: ContentMask<Pixels>) -> ContentMask<Pixels> {
+        if mask == self.from {
+            self.to
+        } else {
+            ContentMask {
+                bounds: mask.bounds + self.offset,
+            }
+            .intersect(&self.to)
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1114,6 +1149,8 @@ impl Frame {
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
+            moved_views: Vec::new(),
+            hitbox_clips: Vec::new(),
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
@@ -1144,6 +1181,8 @@ impl Frame {
         self.hitboxes.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
+        self.moved_views.clear();
+        self.hitbox_clips.clear();
         self.tab_stops.clear();
         self.focus = None;
 
@@ -1178,9 +1217,14 @@ impl Frame {
     pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
-        for hitbox in self.hitboxes.iter().rev() {
+        for (index, hitbox) in self.hitboxes.iter().enumerate().rev() {
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-            if bounds.contains(&position) {
+            if bounds.contains(&position)
+                && self
+                    .hitbox_clips
+                    .iter()
+                    .all(|(range, clip)| !range.contains(&index) || clip.bounds.contains(&position))
+            {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
@@ -4235,7 +4279,7 @@ impl Window {
                             .iter()
                             .copied(),
                     );
-                    self.reuse_prepaint(prepaint_range);
+                    self.reuse_prepaint(prepaint_range, None);
                 }
                 let prepaint_end = self.prepaint_index();
                 self.next_frame.deferred_draws[deferred_draw_ix].prepaint_range =
@@ -4281,7 +4325,7 @@ impl Window {
                 });
                 deferred_draw.accessed_entities.extend(accessed_entities);
             } else {
-                self.reuse_paint(deferred_draw.paint_range.clone());
+                self.reuse_paint(deferred_draw.paint_range.clone(), None);
             }
             let paint_end = self.paint_index();
             deferred_draw.paint_range = paint_start..paint_end;
@@ -4302,17 +4346,202 @@ impl Window {
             hitboxes_index: self.next_frame.hitboxes.len(),
             tooltips_index: self.next_frame.tooltip_requests.len(),
             deferred_draws_index: self.next_frame.deferred_draws.len(),
+            moved_views_index: self.next_frame.moved_views.len(),
+            hitbox_clips_index: self.next_frame.hitbox_clips.len(),
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             line_layout_index: self.text_system.layout_index(),
         }
     }
 
-    pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+    /// Whether a cached view drawn at `rendered_bounds` under `rendered_mask` in
+    /// the rendered frame can be replayed at `bounds` under `view_mask` instead
+    /// of being drawn again.
+    pub(crate) fn can_reuse_moved_view(
+        &self,
+        prepaint_range: &Range<PrepaintStateIndex>,
+        paint_range: &Range<PaintIndex>,
+        rendered_bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
+        rendered_mask: &ContentMask<Pixels>,
+        view_mask: ContentMask<Pixels>,
+    ) -> bool {
+        if rendered_bounds.size != bounds.size || self.a11y.is_active() {
+            return false;
+        }
+
+        // Output outside of the mask the view was drawn under was dropped, so
+        // only a view that was drawn whole can be replayed elsewhere.
+        if rendered_bounds.intersect(&rendered_mask.bounds) != rendered_bounds {
+            return false;
+        }
+
+        // Glyphs are rasterized for a device pixel position, so a fractional
+        // move would not match what drawing the view again produces.
+        let offset = (bounds.origin - rendered_bounds.origin).scale(self.scale_factor());
+        if offset.x.0.fract() != 0. || offset.y.0.fract() != 0. {
+            return false;
+        }
+
+        // Hover styles depend on which of the view's hitboxes hold the pointer.
+        if rendered_bounds.contains(&self.mouse_position) || bounds.contains(&self.mouse_position) {
+            let translation = ViewTranslation {
+                offset: bounds.origin - rendered_bounds.origin,
+                from: *rendered_mask,
+                to: view_mask,
+            };
+            let hitboxes = &self.rendered_frame.hitboxes
+                [prepaint_range.start.hitboxes_index..prepaint_range.end.hitboxes_index];
+            for hitbox in hitboxes {
+                let was_under_pointer = hitbox
+                    .bounds
+                    .intersect(&hitbox.content_mask.bounds)
+                    .contains(&self.mouse_position);
+                let is_under_pointer = translation
+                    .apply(hitbox.bounds)
+                    .intersect(&translation.apply_to_mask(hitbox.content_mask).bounds)
+                    .contains(&self.mouse_position);
+                if was_under_pointer != is_under_pointer {
+                    return false;
+                }
+            }
+        }
+
+        if prepaint_range.start.deferred_draws_index != prepaint_range.end.deferred_draws_index
+            || prepaint_range.start.tooltips_index != prepaint_range.end.tooltips_index
+            || paint_range.start.input_handlers_index != paint_range.end.input_handlers_index
+        {
+            return false;
+        }
+
+        // A focused element can act on positions it recorded while it drew,
+        // such as where to anchor a menu opened from the keyboard.
+        if self.focus.is_some() {
+            let focus_index = self.focus_node_id_in_rendered_frame(self.focus).index();
+            if (prepaint_range.start.dispatch_tree_index..prepaint_range.end.dispatch_tree_index)
+                .contains(&focus_index)
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// The content mask to draw a cached view under: wide enough to draw the
+    /// whole view when part of it is hidden, so that its output can be
+    /// replayed once it moves. The view is still only shown inside of the
+    /// current content mask; see [`Self::paint_with_view_mask`].
+    pub(crate) fn view_mask(&self, bounds: Bounds<Pixels>, cx: &App) -> ContentMask<Pixels> {
+        let content_mask = self.content_mask();
+        // A view larger than what shows it would draw far more than is seen.
+        if cx.moved_view_reuse
+            && bounds.size.width <= content_mask.bounds.size.width
+            && bounds.size.height <= content_mask.bounds.size.height
+        {
+            ContentMask {
+                bounds: content_mask.bounds.union(&bounds),
+            }
+        } else {
+            content_mask
+        }
+    }
+
+    /// Prepaints a view under `view_mask`, keeping its hitboxes inside of the
+    /// current content mask.
+    pub(crate) fn prepaint_with_view_mask<R>(
+        &mut self,
+        view_mask: ContentMask<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let content_mask = self.content_mask();
+        if view_mask == content_mask {
+            return f(self);
+        }
+        let hitboxes_start = self.next_frame.hitboxes.len();
+        self.content_mask_stack.push(view_mask);
+        let result = f(self);
+        self.content_mask_stack.pop();
+        self.next_frame
+            .hitbox_clips
+            .push((hitboxes_start..self.next_frame.hitboxes.len(), content_mask));
+        result
+    }
+
+    /// Paints a view under `view_mask`, showing only what is inside of the
+    /// current content mask.
+    pub(crate) fn paint_with_view_mask<R>(
+        &mut self,
+        view_mask: ContentMask<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let content_mask = self.content_mask();
+        if view_mask == content_mask {
+            return f(self);
+        }
+        let clip = self.snapped_content_mask();
+        self.next_frame.scene.push_clip(clip);
+        self.content_mask_stack.push(view_mask);
+        let result = f(self);
+        self.content_mask_stack.pop();
+        self.next_frame.scene.pop_clip();
+        result
+    }
+
+    /// Records that the output of `view_id` was replayed at another position,
+    /// unless the output reused since `prepaint_start` already said so.
+    pub(crate) fn record_moved_view(
+        &mut self,
+        view_id: EntityId,
+        bounds: Bounds<Pixels>,
+        prepaint_start: &PrepaintStateIndex,
+    ) {
+        let reused = &self.next_frame.moved_views[prepaint_start.moved_views_index..];
+        if !reused.iter().any(|(moved_view, _)| *moved_view == view_id) {
+            self.next_frame.moved_views.push((view_id, bounds));
+        }
+    }
+
+    pub(crate) fn reuse_prepaint(
+        &mut self,
+        range: Range<PrepaintStateIndex>,
+        translation: Option<ViewTranslation>,
+    ) {
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
-                .cloned(),
+                .map(|hitbox| {
+                    let mut hitbox = hitbox.clone();
+                    if let Some(translation) = &translation {
+                        hitbox.bounds = translation.apply(hitbox.bounds);
+                        hitbox.content_mask = translation.apply_to_mask(hitbox.content_mask);
+                    }
+                    hitbox
+                }),
+        );
+        let hitbox_shift =
+            self.next_frame.hitboxes.len() as isize - range.end.hitboxes_index as isize;
+        self.next_frame.hitbox_clips.extend(
+            self.rendered_frame.hitbox_clips
+                [range.start.hitbox_clips_index..range.end.hitbox_clips_index]
+                .iter()
+                .map(|(hitboxes, clip)| {
+                    let hitboxes = (hitboxes.start as isize + hitbox_shift) as usize
+                        ..(hitboxes.end as isize + hitbox_shift) as usize;
+                    match &translation {
+                        Some(translation) => (hitboxes, translation.apply_to_mask(*clip)),
+                        None => (hitboxes, *clip),
+                    }
+                }),
+        );
+        self.next_frame.moved_views.extend(
+            self.rendered_frame.moved_views
+                [range.start.moved_views_index..range.end.moved_views_index]
+                .iter()
+                .map(|(view_id, bounds)| match &translation {
+                    Some(translation) => (*view_id, translation.apply(*bounds)),
+                    None => (*view_id, *bounds),
+                }),
         );
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
@@ -4374,14 +4603,22 @@ impl Window {
         }
     }
 
-    pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+    pub(crate) fn reuse_paint(
+        &mut self,
+        range: Range<PaintIndex>,
+        translation: Option<ViewTranslation>,
+    ) {
         // Cached elements still exist in the frame even when their paint methods don't run.
         #[cfg(any(test, feature = "test-support"))]
         for (selector, bounds) in &self.rendered_frame.debug_bounds_records
             [range.start.debug_bounds_index..range.end.debug_bounds_index]
         {
+            let bounds = match &translation {
+                Some(translation) => translation.apply(*bounds),
+                None => *bounds,
+            };
             self.next_frame
-                .record_debug_bounds(selector.clone(), *bounds);
+                .record_debug_bounds(selector.clone(), bounds);
         }
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
@@ -4414,10 +4651,29 @@ impl Window {
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
-        self.next_frame.scene.replay(
-            range.start.scene_index..range.end.scene_index,
-            &self.rendered_frame.scene,
-        );
+        let scene_range = range.start.scene_index..range.end.scene_index;
+        match translation {
+            Some(translation) => {
+                let offset = translation.offset.scale(self.scale_factor());
+                let from = ContentMask {
+                    bounds: self.cover_bounds(translation.from.bounds),
+                };
+                let to = ContentMask {
+                    bounds: self.cover_bounds(translation.to.bounds),
+                };
+                self.next_frame.scene.replay_translated(
+                    scene_range,
+                    &self.rendered_frame.scene,
+                    offset,
+                    &from,
+                    &to,
+                );
+            }
+            None => self
+                .next_frame
+                .scene
+                .replay(scene_range, &self.rendered_frame.scene),
+        }
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -6278,6 +6534,26 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
+        // The listeners of a view replayed at another position still hold the
+        // bounds it was drawn at, so draw it where it is now before they run.
+        // Scrolling is left out: its listeners go by hitbox, and the view under
+        // the pointer would otherwise be drawn twice for every scroll.
+        let mut redraw = false;
+        let moved_views = if event.is::<crate::ScrollEvent>() {
+            &[]
+        } else {
+            self.rendered_frame.moved_views.as_slice()
+        };
+        for (view_id, bounds) in moved_views {
+            if bounds.contains(&self.mouse_position) {
+                self.invalidator.redraw_view(*view_id);
+                redraw = true;
+            }
+        }
+        if redraw {
+            self.draw(cx).clear(cx);
+        }
+
         self.mouse_hit_test = self.rendered_frame.hit_test(self.mouse_position());
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -10681,6 +10957,244 @@ mod tests {
                 inner: cx.new(|_| RedrawScopeSidebar { renders: 0 }),
             }),
         })
+    }
+
+    struct MovedRow {
+        selector: &'static str,
+        renders: usize,
+        clicks: usize,
+    }
+
+    impl Render for MovedRow {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders += 1;
+            let selector = self.selector;
+            div()
+                .id("row")
+                .debug_selector(move || selector.into())
+                .size_full()
+                .bg(crate::red())
+                .on_click(cx.listener(|row, _, _, _| row.clicks += 1))
+                .child("row")
+        }
+    }
+
+    struct MovedRows {
+        offset: Pixels,
+        rows: [crate::Entity<MovedRow>; 2],
+    }
+
+    impl Render for MovedRows {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let row_style = crate::StyleRefinement::default().w(px(100.)).h(px(40.));
+            div()
+                .size(px(300.))
+                .overflow_hidden()
+                .pt(self.offset)
+                .child(self.rows[0].clone().cached(row_style.clone()))
+                .child(self.rows[1].clone().cached(row_style))
+        }
+    }
+
+    fn moved_rows_window(
+        cx: &mut TestAppContext,
+    ) -> (crate::Entity<MovedRows>, &mut crate::VisualTestContext) {
+        let (rows, cx) = cx.add_window_view(|_, cx| MovedRows {
+            offset: px(20.),
+            rows: ["first row", "second row"].map(|selector| {
+                cx.new(|_| MovedRow {
+                    selector,
+                    renders: 0,
+                    clicks: 0,
+                })
+            }),
+        });
+        cx.update(|_, cx| cx.set_nested_view_caching(true));
+        cx.simulate_mouse_move(point(px(250.), px(250.)), None, crate::Modifiers::default());
+        (rows, cx)
+    }
+
+    /// Moves the rows and returns how often each has rendered, after drawing
+    /// every frame that was requested.
+    fn moved_rows_renders(
+        rows: &crate::Entity<MovedRows>,
+        offset: Pixels,
+        cx: &mut crate::VisualTestContext,
+    ) -> [usize; 2] {
+        rows.update(cx, |rows, cx| {
+            rows.offset = offset;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            for _ in 0..3 {
+                if window.invalidator.is_dirty() {
+                    window.draw(cx).clear(cx);
+                }
+            }
+            let rows = rows.read(cx);
+            [rows.rows[0].read(cx).renders, rows.rows[1].read(cx).renders]
+        })
+    }
+
+    #[gpui::test]
+    fn a_cached_view_that_moved_is_redrawn_by_default(cx: &mut TestAppContext) {
+        let (rows, cx) = moved_rows_window(cx);
+        let renders = moved_rows_renders(&rows, px(20.), cx);
+        let renders_after_move = moved_rows_renders(&rows, px(50.), cx);
+        assert_eq!(renders_after_move, [renders[0] + 1, renders[1] + 1]);
+    }
+
+    #[gpui::test]
+    fn moved_view_reuse_replays_a_view_at_its_new_position(cx: &mut TestAppContext) {
+        let (rows, cx) = moved_rows_window(cx);
+        cx.update(|_, cx| cx.set_moved_view_reuse(true));
+        let renders = moved_rows_renders(&rows, px(20.), cx);
+        let first_row = cx.debug_bounds("first row").unwrap();
+        let scene_before = cx.update(|window, _| {
+            let scene = &window.rendered_frame.scene;
+            (scene.quads.len(), scene.monochrome_sprites.len())
+        });
+
+        assert_eq!(moved_rows_renders(&rows, px(50.), cx), renders);
+        assert_eq!(
+            cx.debug_bounds("first row").unwrap(),
+            first_row + point(px(0.), px(30.))
+        );
+        assert_eq!(
+            cx.debug_bounds("second row").unwrap().origin,
+            point(px(0.), px(90.))
+        );
+        let scale_factor = cx.update(|window, _| window.scale_factor());
+        cx.update(|window, _| {
+            let scene = &window.rendered_frame.scene;
+            assert_eq!(
+                (scene.quads.len(), scene.monochrome_sprites.len()),
+                scene_before
+            );
+            let row_quads = scene
+                .quads
+                .iter()
+                .filter(|quad| quad.bounds.size.width.0 == 100. * scale_factor)
+                .map(|quad| quad.bounds.origin.y.0)
+                .collect::<Vec<_>>();
+            assert_eq!(row_quads, [50. * scale_factor, 90. * scale_factor]);
+        });
+
+        // Moving twice in a row and staying in place both keep the cache.
+        assert_eq!(moved_rows_renders(&rows, px(120.), cx), renders);
+        assert_eq!(moved_rows_renders(&rows, px(120.), cx), renders);
+        assert_eq!(
+            cx.debug_bounds("second row").unwrap().origin,
+            point(px(0.), px(160.))
+        );
+    }
+
+    #[gpui::test]
+    fn a_click_reaches_a_view_where_it_moved_to(cx: &mut TestAppContext) {
+        let (rows, cx) = moved_rows_window(cx);
+        cx.update(|_, cx| cx.set_moved_view_reuse(true));
+        let renders = moved_rows_renders(&rows, px(20.), cx);
+        assert_eq!(moved_rows_renders(&rows, px(150.), cx), renders);
+        let clicks = |cx: &mut crate::VisualTestContext| {
+            rows.read_with(cx, |rows, cx| {
+                rows.rows.clone().map(|row| row.read(cx).clicks)
+            })
+        };
+
+        // Where the first row was drawn, before it moved.
+        cx.simulate_click(point(px(50.), px(30.)), crate::Modifiers::default());
+        assert_eq!(clicks(cx), [0, 0]);
+
+        // The row is drawn where it is now before the click is dispatched, so
+        // that its listeners see their current bounds.
+        cx.simulate_click(point(px(50.), px(200.)), crate::Modifiers::default());
+        assert_eq!(clicks(cx), [0, 1]);
+        let renders_after_click = moved_rows_renders(&rows, px(150.), cx);
+        assert_eq!(renders_after_click[0], renders[0]);
+        assert!(renders_after_click[1] > renders[1]);
+    }
+
+    #[gpui::test]
+    fn moved_view_reuse_replays_a_view_that_is_cut_off(cx: &mut TestAppContext) {
+        let (rows, cx) = moved_rows_window(cx);
+        cx.update(|_, cx| cx.set_moved_view_reuse(true));
+        let renders = moved_rows_renders(&rows, px(20.), cx);
+        let scale_factor = cx.update(|window, _| window.scale_factor());
+        let row_quads = |cx: &mut crate::VisualTestContext| {
+            cx.update(|window, _| {
+                window
+                    .rendered_frame
+                    .scene
+                    .quads
+                    .iter()
+                    .filter(|quad| quad.bounds.size.width.0 == 100. * scale_factor)
+                    .map(|quad| {
+                        let visible = quad.bounds.intersect(&quad.content_mask.bounds);
+                        (
+                            visible.top().0 / scale_factor,
+                            visible.bottom().0 / scale_factor,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let clicks = |cx: &mut crate::VisualTestContext| {
+            rows.read_with(cx, |rows, cx| {
+                rows.rows.clone().map(|row| row.read(cx).clicks)
+            })
+        };
+
+        // The second row leaves the container in part, and is only shown and
+        // clicked inside of it.
+        assert_eq!(moved_rows_renders(&rows, px(240.), cx), renders);
+        assert_eq!(row_quads(cx), [(240., 280.), (280., 300.)]);
+        cx.simulate_click(point(px(50.), px(310.)), crate::Modifiers::default());
+        assert_eq!(clicks(cx), [0, 0]);
+
+        // It was drawn whole, so it is replayed whole on the way back.
+        cx.simulate_mouse_move(point(px(250.), px(250.)), None, crate::Modifiers::default());
+        let renders = moved_rows_renders(&rows, px(240.), cx);
+        assert_eq!(moved_rows_renders(&rows, px(100.), cx), renders);
+        assert_eq!(row_quads(cx), [(100., 140.), (140., 180.)]);
+
+        // A row first drawn while cut off is drawn whole as well.
+        cx.update(|window, _| window.refresh());
+        let renders = moved_rows_renders(&rows, px(240.), cx);
+        assert_eq!(row_quads(cx), [(240., 280.), (280., 300.)]);
+        assert_eq!(moved_rows_renders(&rows, px(100.), cx), renders);
+        assert_eq!(row_quads(cx), [(100., 140.), (140., 180.)]);
+        let glyphs = cx.update(|window, _| window.rendered_frame.scene.monochrome_sprites.len());
+        cx.update(|window, _| window.refresh());
+        moved_rows_renders(&rows, px(100.), cx);
+        assert_eq!(
+            cx.update(|window, _| window.rendered_frame.scene.monochrome_sprites.len()),
+            glyphs
+        );
+        cx.simulate_click(point(px(50.), px(160.)), crate::Modifiers::default());
+        assert_eq!(clicks(cx), [0, 1]);
+    }
+
+    #[gpui::test]
+    fn moved_view_reuse_redraws_what_it_cannot_replay(cx: &mut TestAppContext) {
+        let (rows, cx) = moved_rows_window(cx);
+        cx.update(|_, cx| cx.set_moved_view_reuse(true));
+        moved_rows_renders(&rows, px(20.), cx);
+
+        // The pointer is over where the first row moves to.
+        cx.simulate_mouse_move(point(px(50.), px(30.)), None, crate::Modifiers::default());
+        let renders_before_hover = moved_rows_renders(&rows, px(100.), cx);
+        let renders_under_pointer = moved_rows_renders(&rows, px(20.), cx);
+        assert_eq!(
+            renders_under_pointer,
+            [renders_before_hover[0] + 1, renders_before_hover[1]]
+        );
+
+        // A row that moves under the pointer without the pointer entering or
+        // leaving any part of it is replayed.
+        assert_eq!(
+            moved_rows_renders(&rows, px(25.), cx),
+            renders_under_pointer
+        );
     }
 
     #[gpui::test]
