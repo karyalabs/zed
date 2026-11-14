@@ -829,6 +829,33 @@ pub enum VideoPlanes {
         /// Bytes from one chroma row to the next.
         chroma_stride: u32,
     },
+    /// 8-bit 4:2:0 in GPU memory shared as Linux dmabufs, such as a
+    /// hardware decoder's output, so the frame never passes through system
+    /// memory. The renderer imports each plane as a texture.
+    #[cfg(target_os = "linux")]
+    Nv12Dmabuf {
+        /// The luma plane.
+        luma: DmabufPlane,
+        /// The plane of interleaved Cb and Cr.
+        chroma: DmabufPlane,
+        /// The DRM format modifier (tiling) both planes use.
+        modifier: u64,
+        /// Whatever keeps the buffers from being reused while the frame is
+        /// alive, such as the decoder's sample.
+        _owner: Box<dyn Send + Sync>,
+    },
+}
+
+/// One plane of a dmabuf video frame.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct DmabufPlane {
+    /// The dmabuf holding the plane.
+    pub fd: std::os::fd::OwnedFd,
+    /// Where the plane starts in the dmabuf, in bytes.
+    pub offset: u32,
+    /// Bytes from one row to the next.
+    pub stride: u32,
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -845,6 +872,18 @@ impl std::fmt::Debug for VideoPlanes {
                 .field("bytes", &(**data).as_ref().len())
                 .field("luma_stride", luma_stride)
                 .field("chroma_stride", chroma_stride)
+                .finish_non_exhaustive(),
+            #[cfg(target_os = "linux")]
+            Self::Nv12Dmabuf {
+                luma,
+                chroma,
+                modifier,
+                ..
+            } => formatter
+                .debug_struct("Nv12Dmabuf")
+                .field("luma", luma)
+                .field("chroma", chroma)
+                .field("modifier", &format_args!("{modifier:#x}"))
                 .finish_non_exhaustive(),
         }
     }
@@ -893,6 +932,43 @@ impl VideoFrame {
                 luma_stride,
                 chroma_offset,
                 chroma_stride,
+            },
+        })
+    }
+
+    /// An NV12 frame in two dmabuf planes with the given DRM format modifier.
+    /// `owner` is kept until the frame is dropped; it should keep the
+    /// buffers from being written again (a decoder's sample, for example).
+    /// Only a renderer that can import dmabufs draws such a frame (wgpu on
+    /// Vulkan with `VK_EXT_external_memory_dma_buf` and
+    /// `VK_EXT_image_drm_format_modifier`).
+    #[cfg(target_os = "linux")]
+    pub fn nv12_dmabuf(
+        width: u32,
+        height: u32,
+        colour: VideoColour,
+        luma: DmabufPlane,
+        chroma: DmabufPlane,
+        modifier: u64,
+        owner: impl Send + Sync + 'static,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(width > 0 && height > 0, "empty video frame");
+        anyhow::ensure!(
+            luma.stride >= width && chroma.stride >= width.div_ceil(2) * 2,
+            "video frame stride too small: {}/{} for width {width}",
+            luma.stride,
+            chroma.stride
+        );
+        Ok(Self {
+            id: next_video_frame_id(),
+            width,
+            height,
+            colour,
+            planes: VideoPlanes::Nv12Dmabuf {
+                luma,
+                chroma,
+                modifier,
+                _owner: Box::new(owner),
             },
         })
     }
